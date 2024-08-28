@@ -21,8 +21,7 @@ extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
             WindowsAndMessaging::FindWindowExW(window, None, shell_dll_def_view_name, None);
 
         match shell_dll_def_view {
-            Err(err) => {
-                println!("FindWindowExW DefView failed: {:?}", err);
+            Err(_) => {
                 return true.into();
             }
             Ok(shell_dll_def_view) => {
@@ -32,22 +31,18 @@ extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
                 println!("Found SHELLDLL_DefView window: {:?}", shell_dll_def_view);
                 let worker_w_name =
                     PCWSTR::from_raw("WorkerW\0".encode_utf16().collect::<Vec<u16>>().as_ptr());
-                // let worker_w =
-                //     WindowsAndMessaging::FindWindowExW(shell_dll_def_view, None, worker_w_name, None);
+
                 let worker_w =
                     WindowsAndMessaging::FindWindowExW(window, None,worker_w_name, None);
 
                 match worker_w {
-                    Err(err) => {
-                        println!("FindWindowExW WorkerW failed: {:?}", err);
+                    Err(_) => {
                         return true.into();
                     }
                     Ok(worker_w) => {
                         if worker_w == HWND(null_mut()) {
-                            println!("WorkerW is null, {:?}", worker_w);
                             return true.into(); // 继续枚举
                         }
-                        println!("Found WorkerW window: {:?}", worker_w);
                         *(ref_worker_w.0 as *mut HWND) = worker_w;
                         return false.into(); // 停止枚举
                     }
@@ -70,26 +65,6 @@ pub fn attach(hwnd: HWND) {
 
         WindowsAndMessaging::SendMessageW(progman, 0x052C, WPARAM(0x0000000D), LPARAM(0));
         WindowsAndMessaging::SendMessageW(progman, 0x052C, WPARAM(0x0000000D), LPARAM(1));
-
-        // WindowsAndMessaging::SendMessageTimeoutW(
-        //     progman,
-        //     WindowsAndMessaging::WM_USER + 0x052C,
-        //     WPARAM(0x0000000D),
-        //     LPARAM(0),
-        //     WindowsAndMessaging::SMTO_NORMAL,
-        //     1000,
-        //     Some(null_mut()),
-        // );
-
-        // WindowsAndMessaging::SendMessageTimeoutW(
-        //     progman,
-        //     WindowsAndMessaging::WM_USER + 0x052C,
-        //     WPARAM(0x0000000D),
-        //     LPARAM(1),
-        //     WindowsAndMessaging::SMTO_NORMAL,
-        //     1000,
-        //     Some(null_mut()),
-        // );
 
         let mut worker_w: HWND = HWND(null_mut());
 
