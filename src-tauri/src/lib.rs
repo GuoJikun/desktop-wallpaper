@@ -19,6 +19,13 @@ pub fn attach(window: &WebviewWindow) {
         platforms::windows::attach(hwnd);
         return;
     }
+    #[cfg(target_os = "macos")]
+    {
+        let ns_window = window.ns_window().unwrap();
+        println!("ns_window: {:?}", ns_window);
+        platforms::macos::attach(ns_window);
+        return;
+    }
 }
 
 pub fn detach(window: &WebviewWindow) {
@@ -26,6 +33,12 @@ pub fn detach(window: &WebviewWindow) {
     {
         let hwnd = window.hwnd().unwrap();
         platforms::windows::detach(hwnd);
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ns_window = window.ns_window().unwrap();
+        platforms::macos::detach(ns_window);
         return;
     }
 }
