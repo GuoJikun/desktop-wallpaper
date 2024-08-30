@@ -1,7 +1,9 @@
-<script setup lang="ts"></script>
+<script setup lang="ts">
+import { Settings16Regular as Settings } from "@vicons/fluent";
+</script>
 
 <template>
-    <div class="home">
+    <Layout class="home">
         <div class="home-header">
             <div class="utils">
                 <div class="utils-item">
@@ -14,13 +16,15 @@
             </div>
             <div class="extra">
                 <div class="extra-item">
-                    <router-link to="/settings">设置</router-link>
+                    <router-link to="/settings">
+                        <n-icon size="20"><Settings /></n-icon>
+                    </router-link>
                 </div>
             </div>
         </div>
         <div class="content"></div>
         <div class="footer"></div>
-    </div>
+    </Layout>
 </template>
 <style lang="scss" scoped>
 .home {

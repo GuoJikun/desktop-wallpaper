@@ -22,7 +22,7 @@ onMounted(async () => {
 </script>
 
 <template>
-    <div class="settings">
+    <Layout class="settings">
         <div class="settings-header">
             <n-page-header @back="handleBack" title="设置"></n-page-header>
         </div>
@@ -86,7 +86,7 @@ onMounted(async () => {
                 </div>
             </div>
         </div>
-    </div>
+    </Layout>
 </template>
 
 <style lang="scss" scoped>
@@ -96,7 +96,7 @@ onMounted(async () => {
     min-height: 100%;
     &-header {
         position: sticky;
-        top: var(--window-title);
+        top: 0;
         left: 0;
         background-color: #fff;
         z-index: 1000;

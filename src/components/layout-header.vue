@@ -9,7 +9,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 interface LayoutHeaderProps {
     logo?: string;
-    title: string;
+    title?: string;
 }
 const props = withDefaults(defineProps<LayoutHeaderProps>(), {
     title: "Wallpaper",
