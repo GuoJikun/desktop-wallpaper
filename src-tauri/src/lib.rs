@@ -13,34 +13,15 @@ fn remove_wallpaper(app: AppHandle, window_label: String) {
 }
 
 pub fn attach(window: &WebviewWindow) {
-    #[cfg(target_os = "windows")]
-    {
-        let hwnd = window.hwnd().unwrap();
-        platforms::windows::attach(hwnd);
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let ns_window = window.ns_window().unwrap();
-        println!("ns_window: {:?}", ns_window);
-        platforms::macos::attach(ns_window);
-        return;
-    }
+    let hwnd = window.hwnd().unwrap();
+    platforms::attach(hwnd);
+    return;
 }
 
 pub fn detach(window: &WebviewWindow) {
-    #[cfg(target_os = "windows")]
-    {
-        let hwnd = window.hwnd().unwrap();
-        platforms::windows::detach(hwnd);
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let ns_window = window.ns_window().unwrap();
-        platforms::macos::detach(ns_window);
-        return;
-    }
+    let hwnd = window.hwnd().unwrap();
+    platforms::detach(hwnd);
+    return;
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

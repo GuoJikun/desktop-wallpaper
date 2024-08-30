@@ -1,5 +1,13 @@
 #[cfg(target_os = "windows")]
-pub mod windows;
+#[path = "windows.rs"]
+pub mod platform;
 
 #[cfg(target_os = "macos")]
-pub mod macos;
+#[path = "macos.rs"]
+pub mod platform;
+
+#[cfg(target_os = "linux")]
+#[path = "linux.rs"]
+pub mod platform;
+
+pub use platform::{attach, detach};

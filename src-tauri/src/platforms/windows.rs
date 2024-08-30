@@ -33,7 +33,7 @@ extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
                     PCWSTR::from_raw("WorkerW\0".encode_utf16().collect::<Vec<u16>>().as_ptr());
 
                 let worker_w =
-                    WindowsAndMessaging::FindWindowExW(window, None,worker_w_name, None);
+                    WindowsAndMessaging::FindWindowExW(window, None, worker_w_name, None);
 
                 match worker_w {
                     Err(_) => {
@@ -51,7 +51,6 @@ extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
         }
     }
 }
-
 
 pub fn attach(hwnd: HWND) {
     unsafe {
@@ -78,7 +77,6 @@ pub fn attach(hwnd: HWND) {
         }
 
         let _ = WindowsAndMessaging::SetParent(hwnd, worker_w);
-        
     };
 }
 
