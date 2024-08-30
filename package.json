@@ -12,14 +12,24 @@
   "dependencies": {
     "@tauri-apps/api": ">=2.0.0-rc.0",
     "@tauri-apps/plugin-shell": ">=2.0.0-rc.0",
+    "@vicons/fluent": "^0.12.0",
+    "naive-ui": "^2.39.0",
+    "vfonts": "^0.0.3",
     "vue": "^3.3.4",
     "vue-router": "^4.4.3"
   },
   "devDependencies": {
     "@tauri-apps/cli": ">=2.0.0-rc.0",
+    "@types/node": "^22.5.1",
     "@vitejs/plugin-vue": "^5.0.5",
+    "sass": "^1.77.8",
     "typescript": "^5.2.2",
     "vite": "^5.3.1",
+    "vite-plugin-vue-devtools": "^7.3.9",
     "vue-tsc": "^2.0.22"
+  },
+  "volta": {
+    "node": "20.17.0",
+    "pnpm": "9.9.0"
   }
 }
