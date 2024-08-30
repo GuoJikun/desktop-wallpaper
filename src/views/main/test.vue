@@ -1,5 +1,12 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
+import { useRouter } from "vue-router";
+
+const router = useRouter()
+
+const handleBack = () => {
+  router.back()
+}
 
 const setWallpaper = async () => {
   try {
@@ -20,10 +27,12 @@ const removeWallpaper = async () => {
 
 <template>
   <div>
-    <h1>首页</h1>
-    <main>
-      <button @click="setWallpaper">设置壁纸</button>
-      <button @click="removeWallpaper">移除壁纸</button>
+    <n-page-header @back="handleBack" title="测试页面"></n-page-header>
+    <main style="padding: 16px;">
+      <n-space>
+        <n-button @click="setWallpaper">设置壁纸</n-button>
+        <n-button @click="removeWallpaper">移除壁纸</n-button>
+      </n-space>
     </main>
   </div>
 </template>
