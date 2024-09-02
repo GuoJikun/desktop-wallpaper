@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
+import { getWindowByLabel } from "@/utils/index";
 import { useRouter } from "vue-router";
 
 const router = useRouter();
@@ -11,6 +12,9 @@ const handleBack = () => {
 const setWallpaper = async () => {
     try {
         await invoke("set_wallpaper", { windowLabel: "background" });
+        const curWindow = await getWindowByLabel("background");
+        console.log(curWindow);
+        curWindow.show();
     } catch (error) {
         console.error(error);
     }
@@ -18,6 +22,9 @@ const setWallpaper = async () => {
 
 const removeWallpaper = async () => {
     try {
+        const curWindow = await getWindowByLabel("background");
+        console.log(curWindow);
+        curWindow.hide();
         await invoke("remove_wallpaper", { windowLabel: "background" });
     } catch (error) {
         console.error(error);

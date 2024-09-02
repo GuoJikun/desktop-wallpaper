@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getAllWindows } from "@tauri-apps/api/window";
 
 export const setWallpaper = async (windowLabel: string) => {
     try {
@@ -16,3 +17,7 @@ export const removeWallpaper = async (windowLabel: string) => {
     }
 };
 
+export const getWindowByLabel = async (label: string) => {
+    const windowList = await getAllWindows();
+    return windowList.find(window => window.label === label);
+};

@@ -28,7 +28,7 @@ extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
                 if shell_dll_def_view == HWND(null_mut()) {
                     return true.into(); // 继续枚举
                 }
-                println!("Found SHELLDLL_DefView window: {:?}", shell_dll_def_view);
+
                 let worker_w_name =
                     PCWSTR::from_raw("WorkerW\0".encode_utf16().collect::<Vec<u16>>().as_ptr());
 

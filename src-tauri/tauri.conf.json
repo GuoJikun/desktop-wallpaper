@@ -25,7 +25,8 @@
         "label": "background",
         "fullscreen": true,
         "decorations": true,
-        "url": "/wallpaper"
+        "url": "/wallpaper",
+        "visible": false
       }
     ],
     "security": {
