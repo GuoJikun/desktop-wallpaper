@@ -2,17 +2,20 @@
 //!
 //! 所有 Win32 调用集中在这里，上层 crate 不直接依赖 `windows`。
 
+pub mod capture;
 pub mod desktop;
 pub mod monitor;
 pub mod window;
 
+pub use capture::{capture, save_bmp, ScreenImage};
 pub use desktop::{
     BandState, DesktopHost, PlatformError, ProbeReport, Strategy, TopLevelBottom, WorkerWInfo,
 };
 pub use monitor::{enumerate_monitors, MonitorInfo};
 pub use window::{
-    create_host_window, destroy_host_window, is_host_window_alive, paint_solid, pump_messages,
-    HostWindowSpec, WINDOW_CLASS,
+    class_at_point, create_host_window, destroy_host_window, is_host_window_alive,
+    minimize_other_windows, paint_solid, pump_messages, restore_windows, HostWindowSpec,
+    TEST_COLOR, TEST_RGB, WINDOW_CLASS,
 };
 
 /// 桌面宿主窗口的推荐扩展样式。

@@ -5,10 +5,10 @@
 
 use std::mem::size_of;
 
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, BOOL};
 use windows::Win32::Foundation::{
-    GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, RECT,
-    WPARAM,
+    GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
+    RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetDC, ReleaseDC, HGDIOBJ,
@@ -18,9 +18,11 @@ use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, IsWindow,
-    PeekMessageW, RegisterClassExW, TranslateMessage, HTTRANSPARENT, MSG, PM_REMOVE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WNDCLASS_STYLES, WM_ERASEBKGND, WM_NCHITTEST,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
+    GetClientRect, GetWindowLongPtrW, IsWindow, IsWindowVisible, PeekMessageW, RegisterClassExW,
+    ShowWindow, TranslateMessage, WindowFromPoint, GWL_EXSTYLE, HTTRANSPARENT, MSG, PM_REMOVE,
+    SW_MINIMIZE, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WNDCLASS_STYLES,
+    WM_ERASEBKGND, WM_NCHITTEST,
 };
 
 use wp_core::PhysicalRect;
@@ -32,6 +34,11 @@ use crate::HOST_EX_STYLE;
 pub const HOST_STYLE: u32 = 0x8000_0000 // WS_POPUP
     | 0x1000_0000 // WS_VISIBLE
     | 0x0400_0000; // WS_CLIPSIBLINGS
+
+/// M0 验证用的纯色（COLORREF，0x00BBGGRR）。颜色够醒目，便于截图判读。
+pub const TEST_COLOR: u32 = 0x00_30_30_D0;
+/// 上面对应的 RGB（注意 COLORREF 是 BGR 顺序，低字节是红）。
+pub const TEST_RGB: [u8; 3] = [0xD0, 0x30, 0x30];
 
 /// 窗口类名。必须是全局唯一的常量，改名等于换一类窗口。
 pub const WINDOW_CLASS: &str = "WallpaperHostWindow";
@@ -150,6 +157,77 @@ pub fn pump_messages() -> u32 {
     handled
 }
 
+thread_local! {
+    static MINIMIZED: std::cell::RefCell<Vec<isize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 最小化所有可见的普通顶层窗口，返回被最小化的句柄。
+///
+/// 只为 M0 的截图验证服务：先把桌面亮出来，再挂壁纸。
+/// 桌面壳层（Progman / 任务栏 / WorkerW）和工具窗口会被跳过。
+pub fn minimize_other_windows() -> Vec<isize> {
+    MINIMIZED.with(|v| v.borrow_mut().clear());
+    unsafe {
+        let _ = EnumWindows(Some(minimize_cb), LPARAM(0));
+    }
+    MINIMIZED.with(|v| v.borrow().clone())
+}
+
+/// 恢复 [`minimize_other_windows`] 最小化的窗口。
+pub fn restore_windows(handles: &[isize]) {
+    unsafe {
+        for &h in handles {
+            let _ = ShowWindow(raw(h), SW_RESTORE);
+        }
+    }
+}
+
+unsafe extern "system" fn minimize_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    if !IsWindowVisible(hwnd).as_bool() {
+        return BOOL(1);
+    }
+    // 工具窗口（托盘、输入法等）不碰。
+    let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    if ex_style & 0x0000_0080 != 0 {
+        return BOOL(1);
+    }
+    let class = class_name(hwnd);
+    if matches!(
+        class.as_str(),
+        "Progman" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "WorkerW" | WINDOW_CLASS
+    ) {
+        return BOOL(1);
+    }
+    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+    MINIMIZED.with(|v| v.borrow_mut().push(hwnd.0 as isize));
+    BOOL(1)
+}
+
+fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if n <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..n as usize])
+}
+
+/// 屏幕坐标处最顶层窗口的类名。用于判断某点是否被壁纸窗口吃掉。
+pub fn class_at_point(x: i32, y: i32) -> String {
+    unsafe {
+        let hwnd = WindowFromPoint(POINT { x, y });
+        if hwnd.0.is_null() {
+            return String::from("(none)");
+        }
+        let name = class_name(hwnd);
+        if name.is_empty() {
+            format!("{hwnd:?}")
+        } else {
+            name
+        }
+    }
+}
+
 fn set_dpi_awareness() {
     unsafe {
         // 返回值是旧 context，不关心；失败也无害（进程级 manifest 可能已设置）。
@@ -217,6 +295,13 @@ mod tests {
         assert_ne!(spec.ex_style & 0x0000_0080, 0, "缺少 WS_EX_TOOLWINDOW");
         assert_ne!(spec.ex_style & 0x0000_0020, 0, "缺少 WS_EX_TRANSPARENT");
         assert_ne!(spec.style & 0x8000_0000, 0, "缺少 WS_POPUP");
+    }
+
+    #[test]
+    fn test_rgb_matches_colorref_byte_order() {
+        let c = TEST_COLOR;
+        let expected = [c as u8, (c >> 8) as u8, (c >> 16) as u8];
+        assert_eq!(TEST_RGB, expected, "COLORREF 是 0x00BBGGRR，低字节为红");
     }
 
     /// 真实创建/销毁一次窗口，验证窗口类注册与样式没有拼错。
