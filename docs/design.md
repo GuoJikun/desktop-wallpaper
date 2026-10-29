@@ -118,6 +118,9 @@ pub trait DesktopHost: Send {
 1. DComp `CreateTargetForHwnd(hwnd, topmost)` 必须传 `false`，否则 visual 盖住子窗口里的图标。
 2. 宿主窗销毁前必须先 `SetParent(DefView → Progman)`；`DestroyWindow` 会带走子窗口。
 3. 进程启动时调用 `heal_desktop()`，修复上次异常退出遗留的窗口树；`Drop` 只能兜住正常路径。
+4. **Explorer 重启后宿主进程必须重启。** 新 `SHELLDLL_DefView` 不透明，进程内无论等多久、
+   怎么重建窗口都会黑屏（实测 0%）；只有重启进程才能恢复（94.6%）。
+   因此 `ensure_band() == Lost` 的语义是「请 supervisor 重启 wp-host」，不是「再试一次」。
 
 ### 3.4 状态机
 
@@ -456,4 +459,5 @@ SQLite 开 WAL；迁移用版本号 + 顺序脚本（`PRAGMA user_version`）。
 - [x] ~~B/C 策略的 z 序漂移可通过 `ensure_band` 完全收敛~~ → **部分**：漂移可修正，但 B 会盖住图标，不能作为最终方案
 - [ ] mpv `--wid` 嵌入在置底窗口上能正常输出（D3D 交换链 vs 窗口 surface）
 - [ ] 多屏 + 混合 DPI 下窗口矩形计算无需特殊处理
-- [ ] Explorer 重启后策略 E 能自动重挂（代码已实现，未实测）
+- [x] ~~Explorer 重启后策略 E 能自动重挂~~ → **已验明**：进程内无法自愈，
+  必须由 supervisor 重启 `wp-host`（详见 `wallpaper-probe-26h2.md` §7.5）

@@ -16,6 +16,9 @@
 3. **策略 E 的三条铁律**：① DComp `CreateTargetForHwnd` 的 `topmost` 必须为 `false`；
    ② 销毁宿主窗口前必须先把 DefView 还给 `Progman`；③ 进程启动先跑 `heal_desktop()`。
    违反任一条 → 图标消失、盖住图标或被 `DestroyWindow` 一起带走。
+   **第四条：Explorer 重启后必须重启 `wp-host` 进程。** 新 `SHELLDLL_DefView` 不透明，
+   进程内重建窗口实测仍是黑屏（0%），只有重启进程能恢复（94.6%）。
+   所以 `ensure_band() == Lost` 的含义是「请 supervisor 重启本进程」，不要原地重试。
 4. **不要把内容画到 `Progman` 子窗口的 GDI 表面上。** 实测黑屏，且会被 DefView 盖住。
 5. **不要只调用一次 `SetWindowPos` 就认为层级正确。** z 带会漂移，必须有看门狗。
 6. **不要让壁纸窗口吃掉桌面输入。** 除 `WS_EX_TRANSPARENT` 外，必须实现 `WM_NCHITTEST → HTTRANSPARENT`。
@@ -58,7 +61,8 @@
 | 场景 | 现状 |
 |---|---|
 | 多显示器 / 混合 DPI | 单屏环境，未验证 |
-| Explorer 重启、`Win+D`、任务视图 | 代码已实现重挂；`Win+D` 人工试过无异常 |
+| Explorer 重启 | **已实测**：进程内无解，须重启 `wp-host`（watchdog 报 `Lost`，端到端验证通过） |
+| `Win+D`、任务视图 | 人工试过无异常，待脚本化验证 |
 | 锁屏解锁、RDP 重连、休眠唤醒 | 未验证 |
 | 崩溃后桌面自愈 | `heal_desktop()` 已实现，未做故障注入测试 |
 | 全屏独占游戏暂停判定 | 未验证 |
