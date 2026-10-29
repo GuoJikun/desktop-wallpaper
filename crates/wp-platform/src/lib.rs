@@ -13,8 +13,9 @@ pub use capture::{capture, save_bmp, ScreenImage};
 pub use dcomp::DcompSurface;
 pub use input::{desktop_pid, new_top_level, press_escape, right_click, snapshot_top_level};
 pub use desktop::{
-    heal_desktop, BandState, DesktopHost, PlatformError, ProbeReport, Strategy, TopLevelBottom,
-    WorkerWInfo,
+    defview_state, heal_desktop, progman_z, resize_defview, z_index_of, BandState, DesktopHost,
+    PlatformError,
+    ProbeReport, Strategy, TopLevelBottom, WorkerWInfo,
 };
 pub use monitor::{enumerate_monitors, MonitorInfo};
 pub use window::{

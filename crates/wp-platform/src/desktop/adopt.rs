@@ -19,7 +19,7 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetParent, GetWindowRect, IsWindow, IsWindowVisible, SetParent, SetWindowPos, HWND_BOTTOM,
-    HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW,
+    HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SWP_SHOWWINDOW,
 };
 
 use wp_core::PhysicalRect;
@@ -28,6 +28,17 @@ use super::probe;
 use super::{BandState, DesktopHost, PlatformError, Result, Strategy};
 use crate::window::raw;
 
+/// Explorer 重启后，新的 `SHELLDLL_DefView` 是**不透明**的：挂在它前面的壁纸会被整个盖住。
+/// 实测（26H2，杀 Explorer 后截图）：
+///
+/// | 处理方式 | 测试色占比 |
+/// |---|---|
+/// | 沿用旧宿主窗口，等 5 s / 15 s 再接管 | 0.0%（把图标层缩小后立刻 89.8%，证明壁纸本身在渲染） |
+/// | 进程内重建宿主窗口后再接管 | 0.0% |
+/// | 整个进程重启后再接管 | **94.6%**（图标正常） |
+///
+/// 唯一有效的是让 Explorer 看到「图标层的父进程已经死了」，它才会重新初始化背景。
+/// 所以这一格必须交给上层：平台层报 [`BandState::Lost`]，由 supervisor 重启 `wp-host`。
 pub struct DefViewAdopt {
     rect: PhysicalRect,
     /// `HWND` 不是 `Send`，而 `DesktopHost` 要求 `Send`，所以存成 `isize`。
@@ -105,8 +116,7 @@ impl DefViewAdopt {
     }
 
     /// 还原：DefView 还给 Progman，并铺满整个屏。
-    fn restore(&mut self, rect: PhysicalRect) -> Result<()> {
-        if self.defview == 0 {
+    fn restore(&mut self, rect: PhysicalRect) -> Result<()> {        if self.defview == 0 {
             return Ok(());
         }
         if !unsafe { IsWindow(Some(raw(self.defview))).as_bool() } {
@@ -155,19 +165,14 @@ impl DesktopHost for DefViewAdopt {
             return Ok(BandState::Lost);
         }
 
-        // Explorer 重启会把 DefView 换掉，旧句柄失效就重新找一遍再挂。
-        let defview = raw(self.defview);
-        if !unsafe { IsWindow(Some(defview)) }.as_bool() {
-            let progman = probe::progman().ok_or(PlatformError::NoDesktopHost)?;
-            let Some(next) = find_defview(progman) else {
-                return Ok(BandState::Lost);
-            };
-            self.progman = progman.0 as isize;
-            self.defview = next.0 as isize;
-            self.adopt(host, self.rect)?;
-            self.corrections += 1;
-            return Ok(BandState::Corrected);
+        // 图标层句柄失效 = Explorer 换了桌面壳层。
+        // 新的 `SHELLDLL_DefView` 是不透明的，本进程内怎么补救都没用，
+        // 只能报 `Lost`，由上层重启宿主进程（详见类型文档里的实测对照）。
+        if !unsafe { IsWindow(Some(raw(self.defview))) }.as_bool() {
+            return Ok(BandState::Lost);
         }
+
+        let defview = raw(self.defview);
 
         // 父窗口不是我们，或者被隐藏了，就重新挂一次。
         let parent = unsafe { GetParent(defview) }.ok();
@@ -205,6 +210,53 @@ fn find_defview(progman: HWND) -> Option<HWND> {
     probe::top_level_windows()
         .into_iter()
         .find_map(|h| probe::find_child(h, "SHELLDLL_DefView", None))
+}
+
+/// 诊断：图标层当前挂在哪个父窗口下。
+pub fn defview_state() -> String {
+    let Some(progman) = probe::progman() else {
+        return "无 Progman".into();
+    };
+    let found = find_defview(progman);
+    let all = probe::all_defviews();
+    let list: Vec<String> = all
+        .iter()
+        .map(|(h, p, v)| format!("{h:?}parent={p:?},visible={v}"))
+        .collect();
+    match found {
+        None => format!("无 DefView（全机 0 个: {list:?}）"),
+        Some(defview) => {
+            let parent = unsafe { GetParent(defview) }.ok();
+            let visible = unsafe { IsWindowVisible(defview).as_bool() };
+            let mut r = windows::Win32::Foundation::RECT::default();
+            let _ = unsafe { GetWindowRect(defview, &mut r) };
+            format!(
+                "defview={defview:?} parent={parent:?} visible={visible} rect=({},{},{},{}) 全机共 {} 个 {list:?}",
+                r.left,
+                r.top,
+                r.right,
+                r.bottom,
+                all.len()
+            )
+        }
+    }
+}
+
+/// 诊断：把当前图标层改成指定矩形（相对其父窗口客户区）。
+///
+/// 用来区分「图标层不透明把壁纸盖住」和「宿主窗口压根没合成」：
+/// 把图标层缩到角落，如果屏幕其余部分能看见壁纸，就是前者。
+pub fn resize_defview(x: i32, y: i32, w: i32, h: i32) -> bool {
+    let Some(progman) = probe::progman() else {
+        return false;
+    };
+    let Some(defview) = find_defview(progman) else {
+        return false;
+    };
+    let flags = SET_WINDOW_POS_FLAGS(
+        SWP_NOACTIVATE.0 | SWP_NOOWNERZORDER.0 | SWP_NOZORDER.0 | SWP_SHOWWINDOW.0,
+    );
+    unsafe { SetWindowPos(defview, None, x, y, w, h, flags) }.is_ok()
 }
 
 /// 自愈：如果图标层被上一次异常退出留在了别的父窗口下，把它还给 `Progman`。

@@ -288,9 +288,17 @@ pub fn describe(hwnd: isize) -> String {
         let ex_style = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
         let mut r = RECT::default();
         let _ = GetWindowRect(h, &mut r);
+        let mut cloaked: u32 = 0;
+        // DWM 会把「不在当前虚拟桌面」或正在切换的窗口 cloaked 掉：IsWindowVisible 仍为真，但完全不可见。
+        let _ = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            h,
+            windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            4,
+        );
         format!(
-            "visible={visible} parent={parent:?} style=0x{style:08X} exstyle=0x{ex_style:08X} \
-             rect=({},{},{},{})",
+            "visible={visible} cloaked={cloaked} parent={parent:?} style=0x{style:08X} \
+             exstyle=0x{ex_style:08X} rect=({},{},{},{})",
             r.left, r.top, r.right, r.bottom
         )
     }

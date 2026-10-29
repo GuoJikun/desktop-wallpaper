@@ -205,6 +205,31 @@ pub(crate) fn progman() -> Option<HWND> {
     find_window("Progman", None)
 }
 
+/// 诊断：把所有类名为 `SHELLDLL_DefView` 的窗口都列出来（含父窗口与可见性）。
+///
+/// Explorer 重启过程中可能短暂存在多个图标层，接管错一个就会看到「画面被盖住」。
+pub(crate) fn all_defviews() -> Vec<(HWND, Option<HWND>, bool)> {
+    let mut out = Vec::new();
+    for top in top_level_windows() {
+        if class_of(top) == "SHELLDLL_DefView" {
+            let parent = unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(top) }.ok();
+            let visible = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(top) }
+                .as_bool();
+            out.push((top, parent, visible));
+        }
+        for child in child_windows(top) {
+            if class_of(child) != "SHELLDLL_DefView" {
+                continue;
+            }
+            let parent = unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(child) }.ok();
+            let visible = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(child) }
+                .as_bool();
+            out.push((child, parent, visible));
+        }
+    }
+    out
+}
+
 pub(crate) fn find_window(class: &str, title: Option<&str>) -> Option<HWND> {
     let cls = wide(class);
     let title = title.map(wide);

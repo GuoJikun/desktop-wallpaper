@@ -49,6 +49,15 @@ enum Cmd {
         /// 截图后模拟桌面右键，验证壁纸没吃掉桌面输入
         #[arg(long)]
         input_test: bool,
+        /// 每次看门狗检查都打印窗口状态，用于定位层级问题
+        #[arg(long)]
+        verbose: bool,
+        /// 诊断：截图后再把图标层还给 Progman 截一张，区分「没渲染」和「被盖住」
+        #[arg(long)]
+        detach_shot: bool,
+        /// 诊断：截图后把图标层缩到左上角 400×300 再截一张
+        #[arg(long)]
+        shrink_shot: bool,
     },
     /// 截取整屏到 BMP，不做其它事
     Shot {
@@ -100,6 +109,9 @@ fn main() -> Result<()> {
             shot,
             minimize,
             input_test,
+            verbose,
+            detach_shot,
+            shrink_shot,
         } => probe(
             json,
             report,
@@ -110,6 +122,9 @@ fn main() -> Result<()> {
                 shot: shot.as_deref(),
                 minimize,
                 input_test,
+                verbose,
+                detach_shot,
+                shrink_shot,
             },
             monitor,
         ),
@@ -149,6 +164,9 @@ struct RunOpts<'a> {
     shot: Option<&'a Path>,
     minimize: bool,
     input_test: bool,
+    verbose: bool,
+    detach_shot: bool,
+    shrink_shot: bool,
 }
 
 fn probe(
@@ -382,21 +400,10 @@ fn run_one(
 
     // D3D 内容必须在 attach 之后创建：策略 A 会重新 SetParent，
     // 提前建的 DComp target 会挂在旧父窗口上。
+    let topmost = strategy != Strategy::DefViewAdopt;
     let mut surface = if content == "d3d" && attached {
         // 策略 E 里 DefView 是我们的子窗口，visual 必须在子窗口之下。
-        let topmost = strategy != Strategy::DefViewAdopt;
-        match wp_platform::DcompSurface::new(
-            hwnd,
-            monitor.rect.width,
-            monitor.rect.height,
-            topmost,
-        ) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("[{name}] DComp 初始化失败: {e}");
-                None
-            }
-        }
+        make_surface(name, hwnd, monitor.rect, topmost)
     } else {
         None
     };
@@ -407,10 +414,13 @@ fn run_one(
     let mut shot_at = opts.shot.map(|_| start + Duration::from_secs(duration.max(2) / 2));
     let mut shot_result: Option<Value> = None;
     let mut input_result: Option<Value> = None;
+    let mut detach_shot_result: Option<Value> = None;
+    let mut shrink_shot_result: Option<Value> = None;
     let mut checks = 0u64;
     let mut corrected = 0u64;
     let mut lost = 0u64;
     let mut final_band: Option<BandState> = None;
+    let mut needs_restart = false;
 
     while start.elapsed() < Duration::from_secs(duration) {
         wp_platform::pump_messages();
@@ -432,6 +442,26 @@ fn run_one(
                         }
                     }
                     final_band = Some(state);
+                    // Explorer 重启后新的图标层是不透明的，沿用当前进程无论重建窗口还是等多久都黑屏
+                    // （实测 0%；杀掉进程再起一次立刻恢复 94.6%）。
+                    // 所以在进程内没有可行解法——请求上层重启 wp-host，这里是唯一正确的出口。
+                    if state == BandState::Lost {
+                        eprintln!(
+                            "[{name}] 桌面壳层已更换，本进程无法自愈，需要重启渲染进程"
+                        );
+                        needs_restart = true;
+                        break;
+                    }
+                    if opts.verbose {
+                        eprintln!(
+                            "[{name}] #{checks} state={} host_z={:?} progman_z={:?} {}\n           {}",
+                            band_name(state),
+                            wp_platform::z_index_of(hwnd),
+                            wp_platform::progman_z(),
+                            wp_platform::describe(hwnd),
+                            wp_platform::defview_state()
+                        );
+                    }
                 }
                 Err(e) => {
                     lost += 1;
@@ -468,6 +498,34 @@ fn run_one(
             input_result = Some(test_input(monitor.rect, opts.minimize));
         }
 
+        // 诊断：把图标层还给 Progman 后再截一张，用来区分
+        // 「我们的窗口没渲染」和「图标层盖住了我们的画面」。
+        if opts.detach_shot && shot_result.is_some() && detach_shot_result.is_none() {
+            let _ = host.detach(hwnd);
+            std::thread::sleep(Duration::from_millis(600));
+            let path = PathBuf::from(format!("{}.detached.bmp", opts.shot.unwrap().display()));
+            detach_shot_result = Some(take_shot(name, &path, monitor.rect, opts.minimize)?);
+            let _ = host.attach(hwnd, monitor.rect);
+        }
+
+        // 诊断：把图标层缩到角落。若屏幕其余部分露出壁纸，说明是图标层不透明盖住了我们；
+        // 若整屏仍然没有壁纸，说明宿主窗口本身没合成。
+        if opts.shrink_shot && shot_result.is_some() && shrink_shot_result.is_none() {
+            if wp_platform::resize_defview(0, 0, 400, 300) {
+                std::thread::sleep(Duration::from_millis(600));
+                let path = PathBuf::from(format!("{}.shrunk.bmp", opts.shot.unwrap().display()));
+                shrink_shot_result = Some(take_shot(name, &path, monitor.rect, opts.minimize)?);
+                wp_platform::resize_defview(
+                    0,
+                    0,
+                    monitor.rect.width as i32,
+                    monitor.rect.height as i32,
+                );
+            } else {
+                eprintln!("[{name}] 缩窗诊断失败：没找到图标层");
+            }
+        }
+
         std::thread::sleep(Duration::from_millis(16));
     }
 
@@ -500,8 +558,11 @@ fn run_one(
         "corrected": corrected,
         "lost": lost,
         "final_band": final_band.map(band_name),
+        "needs_restart": needs_restart,
         "handle_alive": handle_alive,
         "shot": shot_result,
+        "detach_shot": detach_shot_result,
+        "shrink_shot": shrink_shot_result,
         "input": input_result,
     }))
 }
@@ -568,6 +629,22 @@ fn band_name(state: BandState) -> &'static str {
         BandState::Correct => "correct",
         BandState::Corrected => "corrected",
         BandState::Lost => "lost",
+    }
+}
+
+/// 建一块 DComp 表面，失败只打日志不中断测试。
+fn make_surface(
+    name: &str,
+    hwnd: isize,
+    rect: PhysicalRect,
+    topmost: bool,
+) -> Option<wp_platform::DcompSurface> {
+    match wp_platform::DcompSurface::new(hwnd, rect.width, rect.height, topmost) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[{name}] DComp 初始化失败: {e}");
+            None
+        }
     }
 }
 

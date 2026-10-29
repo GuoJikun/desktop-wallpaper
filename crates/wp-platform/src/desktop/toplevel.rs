@@ -8,6 +8,8 @@
 //! 代价：z 序会被系统（前台切换、`Win+D`、Explorer 重启等）改回，
 //! 必须由看门狗每 ~2 s 调一次 [`TopLevelBottom::ensure_band`]。
 
+#![allow(dead_code)]
+
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetTopWindow, GetWindow, IsWindow, SetWindowPos, GW_HWNDNEXT, HWND_BOTTOM, SET_WINDOW_POS_FLAGS,
@@ -133,7 +135,7 @@ pub(crate) fn is_at_bottom_of_band(a: HWND, anchor: HWND) -> bool {
 }
 
 /// 在顶层窗口 z 链中的位置：0 最靠上，依次往下。
-fn z_index(target: HWND) -> Option<u32> {
+pub(crate) fn z_index(target: HWND) -> Option<u32> {
     unsafe {
         let mut cur = GetTopWindow(None).ok()?;
         let mut index = 0u32;

@@ -10,7 +10,7 @@ pub mod workerw;
 
 use wp_core::MonitorKey;
 
-pub use adopt::heal_desktop;
+pub use adopt::{defview_state, heal_desktop, resize_defview};
 pub use probe::{probe, ProbeReport, WorkerWInfo};
 pub use toplevel::TopLevelBottom;
 
@@ -134,4 +134,14 @@ impl std::error::Error for PlatformError {}
 /// 显示器标识包装，便于在日志中区分。
 pub fn monitor_label(key: &MonitorKey) -> &str {
     key.as_str()
+}
+
+/// 顶层窗口 z 序位置（0 最靠上）。诊断用。
+pub fn z_index_of(hwnd: isize) -> Option<u32> {
+    toplevel::z_index(crate::window::raw(hwnd))
+}
+
+/// 桌面窗口当前的 z 序位置。诊断用。
+pub fn progman_z() -> Option<u32> {
+    toplevel::z_index(probe::progman()?)
 }
