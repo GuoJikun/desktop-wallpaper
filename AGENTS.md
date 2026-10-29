@@ -16,14 +16,15 @@
 5. **M1 之前不写任何编辑器代码。** 范围蔓延的最大来源。
 6. **壁纸渲染不能在主进程里做。** 每显示器一个独立 `wp-host` 进程。
 7. **挂不上桌面时退回静态壁纸并提示，绝不黑屏。**
-8. **完成一个小功能就立刻提交一次，不要攒一批改动。** 提交信息必须遵循 Angular 规范：
-   `<type>(<scope>): <subject>`，type 取
+8. **完成一个小功能就立刻提交一次，不要攒一批改动。** 提交信息必须遵循 Angular 规范，
+   且**全部使用中文**：
+   `<type>(<scope>): <中文描述>`，type 取
    `feat | fix | docs | style | refactor | perf | test | build | ci | chore | revert`。
-   subject 用英文祈使句、小写开头、不加句号；scope 用 crate 名去掉 `wp-` 前缀
-   （`core`、`ipc`、`platform`、`render`、`host`、`cli`）。
+   scope 用 crate 名去掉 `wp-` 前缀（`core`、`ipc`、`platform`、`render`、`host`、`cli`），
+   跨模块改动可省略。描述用祈使句、不加句号，长度不超过 40 个汉字。
    破坏性变更用 `!` 标记并在页脚写 `BREAKING CHANGE:`。
-   示例：`feat(platform): add toplevel-bottom host strategy with z-band self-heal`、
-   `fix(cli): fix probe output encoding`。
+   示例：`feat(platform): 添加顶层置底宿主策略与 z 序自愈`、
+   `fix(cli): 修正 probe 输出编码`。
 
 ---
 
