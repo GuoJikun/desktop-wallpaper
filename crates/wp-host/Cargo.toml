@@ -1,0 +1,19 @@
+[package]
+name = "wp-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wp-host"
+path = "src/main.rs"
+
+[dependencies]
+wp-core.workspace = true
+wp-ipc.workspace = true
+wp-platform.workspace = true
+wp-render.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
