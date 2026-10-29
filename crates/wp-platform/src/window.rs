@@ -19,10 +19,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
-    GetClientRect, GetWindowLongPtrW, IsWindow, IsWindowVisible, PeekMessageW, RegisterClassExW,
-    ShowWindow, TranslateMessage, WindowFromPoint, GWL_EXSTYLE, HTTRANSPARENT, MSG, PM_REMOVE,
-    SW_MINIMIZE, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WNDCLASS_STYLES,
-    WM_ERASEBKGND, WM_NCHITTEST,
+    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible,
+    PeekMessageW, RegisterClassExW, ShowWindow, TranslateMessage, WindowFromPoint, GWL_EXSTYLE,
+    GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+    WINDOW_EX_STYLE,
+    WINDOW_STYLE, WNDCLASSEXW, WNDCLASS_STYLES, WM_ERASEBKGND, WM_NCHITTEST,
 };
 
 use wp_core::PhysicalRect;
@@ -195,20 +196,56 @@ pub fn restore_windows(handles: &[isize]) {
     }
 }
 
-unsafe extern "system" fn minimize_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-    if !IsWindowVisible(hwnd).as_bool() {
+thread_local! {
+    static HIDDEN: std::cell::RefCell<Vec<isize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 直接把其它窗口藏起来（比最小化更彻底：不受最小化动画和应用自恢复影响）。
+///
+/// 截图与输入验证都需要「桌面真的在最前面」，最小化对某些应用不可靠。
+pub fn hide_other_windows() -> Vec<isize> {
+    HIDDEN.with(|v| v.borrow_mut().clear());
+    unsafe {
+        let _ = EnumWindows(Some(hide_cb), LPARAM(0));
+    }
+    HIDDEN.with(|v| v.borrow().clone())
+}
+
+/// 恢复 [`hide_other_windows`] 藏起来的窗口。
+pub fn show_windows(handles: &[isize]) {
+    unsafe {
+        for &h in handles {
+            let _ = ShowWindow(raw(h), SW_SHOW);
+        }
+    }
+}
+
+unsafe extern "system" fn hide_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    if should_skip(hwnd) {
         return BOOL(1);
     }
-    // 工具窗口（托盘、输入法等）不碰。
-    let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    HIDDEN.with(|v| v.borrow_mut().push(hwnd.0 as isize));
+    BOOL(1)
+}
+
+/// 桌面壳层、工具窗口和宿主自己都不能动。
+fn should_skip(hwnd: HWND) -> bool {
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return true;
+    }
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     if ex_style & 0x0000_0080 != 0 {
-        return BOOL(1);
+        return true;
     }
-    let class = class_name(hwnd);
-    if matches!(
-        class.as_str(),
+    matches!(
+        class_name(hwnd).as_str(),
         "Progman" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "WorkerW" | WINDOW_CLASS
-    ) {
+    )
+}
+
+unsafe extern "system" fn minimize_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    if should_skip(hwnd) {
         return BOOL(1);
     }
     let _ = ShowWindow(hwnd, SW_MINIMIZE);
@@ -238,6 +275,24 @@ pub fn class_at_point(x: i32, y: i32) -> String {
         } else {
             name
         }
+    }
+}
+
+/// 打印一个窗口的结构化状态，用于排查「attach 成功但画面不可见」。
+pub fn describe(hwnd: isize) -> String {
+    let h = raw(hwnd);
+    unsafe {
+        let visible = IsWindowVisible(h).as_bool();
+        let parent = GetParent(h).ok();
+        let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+        let mut r = RECT::default();
+        let _ = GetWindowRect(h, &mut r);
+        format!(
+            "visible={visible} parent={parent:?} style=0x{style:08X} exstyle=0x{ex_style:08X} \
+             rect=({},{},{},{})",
+            r.left, r.top, r.right, r.bottom
+        )
     }
 }
 

@@ -45,7 +45,15 @@ pub struct DcompSurface {
 }
 
 impl DcompSurface {
-    pub fn new(hwnd: isize, width: u32, height: u32) -> Result<Self, PlatformError> {
+    /// `topmost=true` 时 visual 盖在窗口内容/子窗口之上；`false` 时在其下方。
+    ///
+    /// 策略 E（把 DefView 挂成子窗口）必须用 `false`，否则壁纸会盖住图标。
+    pub fn new(
+        hwnd: isize,
+        width: u32,
+        height: u32,
+        topmost: bool,
+    ) -> Result<Self, PlatformError> {
         unsafe {
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
@@ -97,7 +105,7 @@ impl DcompSurface {
             let dcomp: IDCompositionDevice =
                 DCompositionCreateDevice(&dxgi_device).map_err(|e| win32("DCompositionCreateDevice", e))?;
             let target = dcomp
-                .CreateTargetForHwnd(raw(hwnd), true)
+                .CreateTargetForHwnd(raw(hwnd), topmost)
                 .map_err(|e| win32("CreateTargetForHwnd", e))?;
             let visual = dcomp
                 .CreateVisual()

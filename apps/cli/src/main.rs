@@ -46,6 +46,9 @@ enum Cmd {
         /// 测试前最小化其它窗口，测试后恢复
         #[arg(long)]
         minimize: bool,
+        /// 截图后模拟桌面右键，验证壁纸没吃掉桌面输入
+        #[arg(long)]
+        input_test: bool,
     },
     /// 截取整屏到 BMP，不做其它事
     Shot {
@@ -69,6 +72,15 @@ enum Cmd {
     Pause,
     /// 查看渲染进程状态
     Stats,
+    /// 在桌面上模拟右键，验证桌面输入是否正常（基线对照用）
+    InputTest {
+        /// 测试前最小化其它窗口，测试后恢复
+        #[arg(long)]
+        minimize: bool,
+        /// 显示器索引
+        #[arg(long, default_value_t = 0)]
+        monitor: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -82,6 +94,7 @@ fn main() -> Result<()> {
             monitor,
             shot,
             minimize,
+            input_test,
         } => probe(
             json,
             report,
@@ -91,10 +104,21 @@ fn main() -> Result<()> {
                 duration,
                 shot: shot.as_deref(),
                 minimize,
+                input_test,
             },
             monitor,
         ),
         Cmd::Shot { out, monitor } => shot_once(&out, monitor),
+        Cmd::InputTest { minimize, monitor } => {
+            let monitors = wp_platform::enumerate_monitors();
+            let rect = monitors
+                .get(monitor)
+                .with_context(|| format!("显示器索引 {monitor} 不存在（共 {} 台）", monitors.len()))?
+                .rect;
+            let result = test_input(rect, minimize);
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         Cmd::Attach { monitor, source } => {
             let monitors = wp_platform::enumerate_monitors();
             let info = monitors
@@ -119,6 +143,7 @@ struct RunOpts<'a> {
     duration: u64,
     shot: Option<&'a Path>,
     minimize: bool,
+    input_test: bool,
 }
 
 fn probe(
@@ -346,12 +371,21 @@ fn run_one(
     let attached = attach_error.is_none();
     if let Some(err) = &attach_error {
         eprintln!("[{name}] attach 失败: {err}");
+    } else {
+        eprintln!("[{name}] attach 后窗口状态: {}", wp_platform::describe(hwnd));
     }
 
     // D3D 内容必须在 attach 之后创建：策略 A 会重新 SetParent，
     // 提前建的 DComp target 会挂在旧父窗口上。
     let mut surface = if content == "d3d" && attached {
-        match wp_platform::DcompSurface::new(hwnd, monitor.rect.width, monitor.rect.height) {
+        // 策略 E 里 DefView 是我们的子窗口，visual 必须在子窗口之下。
+        let topmost = strategy != Strategy::DefViewAdopt;
+        match wp_platform::DcompSurface::new(
+            hwnd,
+            monitor.rect.width,
+            monitor.rect.height,
+            topmost,
+        ) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("[{name}] DComp 初始化失败: {e}");
@@ -367,6 +401,7 @@ fn run_one(
     let mut next_paint = start;
     let mut shot_at = opts.shot.map(|_| start + Duration::from_secs(duration.max(2) / 2));
     let mut shot_result: Option<Value> = None;
+    let mut input_result: Option<Value> = None;
     let mut checks = 0u64;
     let mut corrected = 0u64;
     let mut lost = 0u64;
@@ -419,9 +454,13 @@ fn run_one(
 
         if let (Some(path), Some(at)) = (opts.shot, shot_at) {
             if now >= at {
-                shot_result = Some(take_shot(name, path, monitor.rect)?);
+                shot_result = Some(take_shot(name, path, monitor.rect, opts.minimize)?);
                 shot_at = None;
             }
+        }
+
+        if opts.input_test && shot_result.is_some() && input_result.is_none() {
+            input_result = Some(test_input(monitor.rect, opts.minimize));
         }
 
         std::thread::sleep(Duration::from_millis(16));
@@ -429,6 +468,13 @@ fn run_one(
 
     let handle_alive = wp_platform::is_host_window_alive(hwnd);
     drop(surface);
+    // 一定要先 detach 再销毁窗口：策略 E 会把 DefView 挂成子窗口，
+    // 直接 DestroyWindow 会把图标层一起带走。
+    if attached {
+        if let Err(e) = host.detach(hwnd) {
+            eprintln!("[{name}] detach 失败: {e}");
+        }
+    }
     wp_platform::destroy_host_window(hwnd);
     if !minimized.is_empty() {
         wp_platform::restore_windows(&minimized);
@@ -451,10 +497,24 @@ fn run_one(
         "final_band": final_band.map(band_name),
         "handle_alive": handle_alive,
         "shot": shot_result,
+        "input": input_result,
     }))
 }
 
-fn take_shot(name: &str, path: &Path, rect: PhysicalRect) -> Result<Value> {
+fn take_shot(
+    name: &str,
+    path: &Path,
+    rect: PhysicalRect,
+    minimize: bool,
+) -> Result<Value> {
+    // 截图前再压一次：有些前台窗口会自己弹回来，只在开头最小化一次不够。
+    let extra = if minimize {
+        let handles = wp_platform::hide_other_windows();
+        std::thread::sleep(Duration::from_millis(500));
+        handles
+    } else {
+        Vec::new()
+    };
     // 壁纸窗口刚画完一帧，稍等一下再截，避免抓到没刷新完的合成结果。
     std::thread::sleep(Duration::from_millis(300));
 
@@ -484,6 +544,11 @@ fn take_shot(name: &str, path: &Path, rect: PhysicalRect) -> Result<Value> {
         ratio * 100.0
     );
 
+    // 统计和命中测试都要在截图状态下做，之后才恢复其它窗口。
+    if !extra.is_empty() {
+        wp_platform::show_windows(&extra);
+    }
+
     Ok(json!({
         "path": path.display().to_string(),
         "wallpaper_ratio": ratio,
@@ -499,4 +564,67 @@ fn band_name(state: BandState) -> &'static str {
         BandState::Corrected => "corrected",
         BandState::Lost => "lost",
     }
+}
+
+/// 在屏幕中心模拟右键：桌面上下文菜单能弹出，说明壁纸没吃掉输入。
+fn test_input(rect: PhysicalRect, minimize: bool) -> Value {
+    let x = rect.x + rect.width as i32 / 2;
+    let y = rect.y + rect.height as i32 / 2;
+
+    // 右键必须打到桌面上。有些应用被最小化后会立刻弹回来，
+    // 所以直接隐藏，直到命中桌面窗口为止（最多 5 次）。
+    let mut hidden = Vec::new();
+    let mut hit = String::new();
+    for _ in 0..5 {
+        if minimize {
+            hidden = wp_platform::hide_other_windows();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        hit = wp_platform::class_at_point(x, y);
+        if is_desktop_class(&hit) {
+            break;
+        }
+    }
+
+    let before = wp_platform::snapshot_top_level();
+    let explorer_pid = wp_platform::desktop_pid();
+    let clicked = wp_platform::right_click(x, y).is_ok();
+    std::thread::sleep(Duration::from_millis(700));
+    let new_windows = wp_platform::new_top_level(&before);
+    // 只认 explorer 自己弹出来的窗口，避免把别的应用顺带冒出来的窗口算进来。
+    let menu = new_windows
+        .iter()
+        .any(|(_, pid)| Some(*pid) == explorer_pid);
+    wp_platform::press_escape();
+    std::thread::sleep(Duration::from_millis(300));
+
+    if !hidden.is_empty() {
+        wp_platform::show_windows(&hidden);
+    }
+
+    let hidden_classes: Vec<String> = hidden
+        .iter()
+        .map(|h| wp_platform::input::class_of(*h))
+        .collect();
+    eprintln!(
+        "[input] 在 ({x},{y}) 右键：命中={hit} 隐藏窗口={hidden_classes:?} 发送={clicked} 新窗口={new_windows:?} explorer={explorer_pid:?} 菜单={menu}"
+    );
+
+    json!({
+        "at": [x, y],
+        "hit_class": hit,
+        "on_desktop": is_desktop_class(&hit),
+        "sent": clicked,
+        "new_windows": new_windows,
+        "explorer_pid": explorer_pid,
+        "menu_opened": menu,
+    })
+}
+
+/// 命中这些类名说明鼠标确实落在桌面上，而不是别的应用窗口。
+fn is_desktop_class(class: &str) -> bool {
+    matches!(
+        class,
+        "SysListView32" | "SHELLDLL_DefView" | "Progman" | "WorkerW" | "(none)"
+    )
 }

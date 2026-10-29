@@ -2,6 +2,7 @@
 //!
 //! 26H2 实测结论见 `.opencode/plans/wallpaper-probe-26h2.md`。
 
+pub mod adopt;
 pub mod probe;
 pub mod progman;
 pub mod toplevel;
@@ -17,12 +18,16 @@ pub use toplevel::TopLevelBottom;
 pub enum Strategy {
     /// Progman 子窗口 + DirectComposition。
     ProgmanChild,
+    /// 判别实验：Progman 子窗口，但放在 `SHELLDLL_DefView` **之上**。
+    ProgmanChildTop,
     /// 顶层窗口置于全局 z 序最底层。
     TopLevelBottom,
     /// 顶层窗口精确插入 Progman / DefView 相邻位。
     TopLevelAnchored,
     /// 经典 WorkerW 子窗口（Win10 / 22H2–23H2）。
     WorkerW,
+    /// 反向接管：把 `SHELLDLL_DefView` 挂到自己窗口下。
+    DefViewAdopt,
 }
 
 impl Strategy {
@@ -38,9 +43,11 @@ impl Strategy {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ProgmanChild => "progman_child",
+            Self::ProgmanChildTop => "progman_child_top",
             Self::TopLevelBottom => "toplevel_bottom",
             Self::TopLevelAnchored => "toplevel_anchored",
             Self::WorkerW => "workerw",
+            Self::DefViewAdopt => "defview_adopt",
         }
     }
 
@@ -52,10 +59,12 @@ impl Strategy {
         match self {
             Self::TopLevelBottom => Ok(Box::new(TopLevelBottom::new()?)),
             Self::ProgmanChild => Ok(Box::new(progman::ProgmanChild::new()?)),
+            Self::ProgmanChildTop => Ok(Box::new(progman::ProgmanChild::above_defview()?)),
             Self::TopLevelAnchored => Err(PlatformError::Unsupported(
                 "精确插入 DefView 相邻位待实现（M0 第 3 步）",
             )),
             Self::WorkerW => Ok(Box::new(workerw::WorkerWHost::new()?)),
+            Self::DefViewAdopt => Ok(Box::new(adopt::DefViewAdopt::new()?)),
         }
     }
 }
@@ -66,12 +75,14 @@ impl std::str::FromStr for Strategy {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "progman_child" => Ok(Self::ProgmanChild),
+            "progman_child_top" => Ok(Self::ProgmanChildTop),
             "toplevel_bottom" => Ok(Self::TopLevelBottom),
             "toplevel_anchored" => Ok(Self::TopLevelAnchored),
             "workerw" => Ok(Self::WorkerW),
+            "defview_adopt" => Ok(Self::DefViewAdopt),
             other => Err(PlatformError::Unsupported(match other {
                 "all" => "all 不是单条策略名",
-                _ => "未知策略名（可选 progman_child / toplevel_bottom / toplevel_anchored / workerw）",
+                _ => "未知策略名（progman_child / progman_child_top / toplevel_bottom / toplevel_anchored / workerw / defview_adopt）",
             })),
         }
     }

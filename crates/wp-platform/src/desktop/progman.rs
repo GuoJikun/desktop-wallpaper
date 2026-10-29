@@ -10,8 +10,8 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetParent, GetWindowLongPtrW, GetWindowRect, IsWindow, SetParent, SetWindowLongPtrW, SetWindowPos,
-    GWL_STYLE, HWND_BOTTOM, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_SHOWWINDOW,
-    WS_CHILD, WS_POPUP,
+    GWL_STYLE, HWND_BOTTOM, HWND_TOP, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+    SWP_SHOWWINDOW, WS_CHILD, WS_POPUP,
 };
 
 use wp_core::PhysicalRect;
@@ -23,15 +23,29 @@ use crate::window::raw;
 pub struct ProgmanChild {
     rect: PhysicalRect,
     corrections: u64,
+    /// 放在 DefView 之上（`true`）还是之下（`false`，正常用法）。
+    /// 只是为了做判别实验：如果「之上」能看见、「之下」看不见，
+    /// 说明子窗口合成正常，是 DefView 把它盖住了。
+    above_defview: bool,
 }
 
 impl ProgmanChild {
     pub fn new() -> Result<Self> {
+        Self::with_options(false)
+    }
+
+    /// 判别实验用：把宿主放在 `SHELLDLL_DefView` 之上。
+    pub fn above_defview() -> Result<Self> {
+        Self::with_options(true)
+    }
+
+    fn with_options(above_defview: bool) -> Result<Self> {
         // 提前确认桌面窗口存在，免得 attach 时才报错。
         probe::progman().ok_or(PlatformError::NoDesktopHost)?;
         Ok(Self {
             rect: PhysicalRect::new(0, 0, 0, 0),
             corrections: 0,
+            above_defview,
         })
     }
 
@@ -61,8 +75,13 @@ impl ProgmanChild {
         let (x, y, w, h) = self.child_rect(progman)?;
         let flags = SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOOWNERZORDER.0 | SWP_SHOWWINDOW.0);
         unsafe { SetParent(hwnd, Some(progman)) }.map_err(|e| win32("SetParent", e))?;
-        // 放到兄弟链最底，也就是落在 SHELLDLL_DefView 下面。
-        unsafe { SetWindowPos(hwnd, Some(HWND_BOTTOM), x, y, w, h, flags) }
+        // 正常用法放到兄弟链最底（DefView 下面）；判别实验放到最顶。
+        let insert_after = if self.above_defview {
+            HWND_TOP
+        } else {
+            HWND_BOTTOM
+        };
+        unsafe { SetWindowPos(hwnd, Some(insert_after), x, y, w, h, flags) }
             .map_err(|e| win32("SetWindowPos(child)", e))?;
         Ok(())
     }
