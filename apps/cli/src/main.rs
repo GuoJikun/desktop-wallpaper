@@ -230,8 +230,11 @@ fn print_desktop(desktop: &wp_platform::ProbeReport, monitors: &[wp_platform::Mo
         desktop.workerw_with_defview.as_deref().unwrap_or("无")
     );
     match desktop.spawn_worker_result {
-        Some(code) => println!("  0x052C 返回        : {code}"),
-        None => println!("  0x052C             : 未发送（无 Progman）"),
+        Some(code) => println!("  0x052C (wParam=0)   : {code}"),
+        None => println!("  0x052C (wParam=0)   : 未发送（无 Progman）"),
+    }
+    if let Some(code) = desktop.spawn_worker_result_alt {
+        println!("  0x052C (wParam=0xD) : {code}");
     }
     println!(
         "  发送后出现宿主       : {}",
@@ -332,7 +335,8 @@ fn run_one(
         Vec::new()
     };
 
-    let spec = wp_platform::HostWindowSpec::for_monitor(monitor.rect);
+    let spec = wp_platform::HostWindowSpec::for_monitor(monitor.rect)
+        .with_noredirection_bitmap(content == "d3d");
     let hwnd = wp_platform::create_host_window(&spec)
         .with_context(|| format!("创建宿主窗口失败（{name}）"))?;
 
@@ -343,6 +347,20 @@ fn run_one(
     if let Some(err) = &attach_error {
         eprintln!("[{name}] attach 失败: {err}");
     }
+
+    // D3D 内容必须在 attach 之后创建：策略 A 会重新 SetParent，
+    // 提前建的 DComp target 会挂在旧父窗口上。
+    let mut surface = if content == "d3d" && attached {
+        match wp_platform::DcompSurface::new(hwnd, monitor.rect.width, monitor.rect.height) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("[{name}] DComp 初始化失败: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let start = Instant::now();
     let mut next_check = start;
@@ -390,6 +408,15 @@ fn run_one(
             next_paint = now + Duration::from_millis(500);
         }
 
+        if let Some(surface) = surface.as_mut() {
+            if now >= next_paint {
+                if let Err(e) = surface.clear(wp_platform::TEST_RGB) {
+                    eprintln!("[{name}] DComp 绘制失败: {e}");
+                }
+                next_paint = now + Duration::from_millis(16);
+            }
+        }
+
         if let (Some(path), Some(at)) = (opts.shot, shot_at) {
             if now >= at {
                 shot_result = Some(take_shot(name, path, monitor.rect)?);
@@ -401,6 +428,7 @@ fn run_one(
     }
 
     let handle_alive = wp_platform::is_host_window_alive(hwnd);
+    drop(surface);
     wp_platform::destroy_host_window(hwnd);
     if !minimized.is_empty() {
         wp_platform::restore_windows(&minimized);

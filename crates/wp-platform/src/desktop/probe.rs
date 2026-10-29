@@ -16,7 +16,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::Strategy;
 
 const WM_SPAWN_WORKER: u32 = 0x052C;
-const SPAWN_WORKER_WPARAM: usize = 0x0D;
+/// 经典实现（Win10 / 22H2–23H2）用的 wParam，见 `E:\private\Rust\wallpaper`。
+pub(crate) const SPAWN_WORKER_WPARAM_CLASSIC: usize = 0x00;
+/// 旧探测脚本用的 wParam；26H2 上返回 0 且无效果。
+pub(crate) const SPAWN_WORKER_WPARAM_ALT: usize = 0x0D;
 
 thread_local! {
     static COLLECT: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
@@ -38,8 +41,10 @@ pub struct ProbeReport {
     pub workerw: Vec<WorkerWInfo>,
     /// 是否存在「包含 SHELLDLL_DefView 的 WorkerW」——旧系统的经典宿主。
     pub workerw_with_defview: Option<String>,
-    /// `0x052C` 返回值（None 表示没有 Progman，未发送）。
+    /// `0x052C`（经典 wParam=0）返回值（None 表示没有 Progman，未发送）。
     pub spawn_worker_result: Option<i64>,
+    /// `0x052C`（旧 wParam=0x0D）返回值；经典握手已经拉出宿主时为 None（未发送）。
+    pub spawn_worker_result_alt: Option<i64>,
     /// 发送 `0x052C` 之后是否出现了新的宿主。
     pub host_after_spawn: Option<String>,
     /// 推荐尝试顺序。
@@ -59,16 +64,16 @@ pub fn probe() -> ProbeReport {
         .find(|w| w.has_defview)
         .map(|w| w.hwnd.clone());
 
-    // 只有旧系统才需要这个握手；新系统上它通常静默无效。
-    let spawn_worker_result = progman.map(|p| spawn_worker(p));
-    let host_after_spawn = if spawn_worker_result.is_some() {
-        collect_workerw()
-            .into_iter()
-            .find(|w| w.has_defview)
-            .map(|w| w.hwnd)
+    // 经典握手用 wParam=0；旧脚本用 0x0D。两个都试一次，看谁能拉出宿主。
+    let spawn_classic = progman.map(|p| spawn_worker(p, SPAWN_WORKER_WPARAM_CLASSIC));
+    let host_after_classic = find_workerw_host();
+    let spawn_alt = if host_after_classic.is_none() {
+        progman.map(|p| spawn_worker(p, SPAWN_WORKER_WPARAM_ALT))
     } else {
         None
     };
+    let host_after_spawn = host_after_classic.or_else(find_workerw_host);
+    let spawn_worker_result = spawn_classic;
 
     let recommended = recommend(&workerw_with_defview, defview_under_progman);
 
@@ -79,9 +84,26 @@ pub fn probe() -> ProbeReport {
         workerw,
         workerw_with_defview,
         spawn_worker_result,
-        host_after_spawn,
+        spawn_worker_result_alt: spawn_alt,
+        host_after_spawn: host_after_spawn.map(|h| format!("{h:?}")),
         recommended,
     }
+}
+
+/// 经典 WorkerW 宿主查找：找含 `SHELLDLL_DefView` 的顶层窗口，
+/// 再取它**后面**第一个 `WorkerW`。
+///
+/// 这正是 `E:\private\Rust\wallpaper\src-tauri\src\wallpaper.rs` 的做法。
+pub(crate) fn find_workerw_host() -> Option<HWND> {
+    for hwnd in top_level_windows() {
+        if find_child(hwnd, "SHELLDLL_DefView", None).is_none() {
+            continue;
+        }
+        if let Some(w) = find_window_ex(None, Some(hwnd), "WorkerW") {
+            return Some(w);
+        }
+    }
+    None
 }
 
 fn recommend(workerw_with_defview: &Option<String>, defview_under_progman: bool) -> Vec<String> {
@@ -115,13 +137,13 @@ fn collect_workerw() -> Vec<WorkerWInfo> {
         .collect()
 }
 
-fn spawn_worker(progman: HWND) -> i64 {
+pub(crate) fn spawn_worker(progman: HWND, wparam: usize) -> i64 {
     unsafe {
         let mut result: usize = 0;
         let ok = windows::Win32::UI::WindowsAndMessaging::SendMessageTimeoutW(
             progman,
             WM_SPAWN_WORKER,
-            WPARAM(SPAWN_WORKER_WPARAM),
+            WPARAM(wparam),
             LPARAM(0),
             windows::Win32::UI::WindowsAndMessaging::SMTO_NORMAL,
             2000,
@@ -135,7 +157,7 @@ fn spawn_worker(progman: HWND) -> i64 {
     }
 }
 
-fn top_level_windows() -> Vec<HWND> {
+pub(crate) fn top_level_windows() -> Vec<HWND> {
     COLLECT.with(|c| c.borrow_mut().clear());
     unsafe {
         let _ = EnumWindows(Some(collect_cb), LPARAM(0));
@@ -198,21 +220,19 @@ pub(crate) fn find_window(class: &str, title: Option<&str>) -> Option<HWND> {
     .ok()
 }
 
-fn find_child(parent: HWND, class: &str, title: Option<&str>) -> Option<HWND> {
+pub(crate) fn find_child(parent: HWND, class: &str, title: Option<&str>) -> Option<HWND> {
+    find_window_ex(Some(parent), None, class)
+        .filter(|h| title.map(|t| title_of(*h) == t).unwrap_or(true))
+}
+
+/// `FindWindowExW` 的薄封装：`after` 为空表示从第一个子窗口开始找。
+pub(crate) fn find_window_ex(
+    parent: Option<HWND>,
+    after: Option<HWND>,
+    class: &str,
+) -> Option<HWND> {
     let cls = wide(class);
-    let title = title.map(wide);
-    unsafe {
-        FindWindowExW(
-            Some(parent),
-            None,
-            PCWSTR(cls.as_ptr()),
-            title
-                .as_ref()
-                .map(|t| PCWSTR(t.as_ptr()))
-                .unwrap_or(PCWSTR::null()),
-        )
-    }
-    .ok()
+    unsafe { FindWindowExW(parent, after, PCWSTR(cls.as_ptr()), PCWSTR::null()) }.ok()
 }
 
 #[cfg(test)]

@@ -3,11 +3,13 @@
 //! 所有 Win32 调用集中在这里，上层 crate 不直接依赖 `windows`。
 
 pub mod capture;
+pub mod dcomp;
 pub mod desktop;
 pub mod monitor;
 pub mod window;
 
 pub use capture::{capture, save_bmp, ScreenImage};
+pub use dcomp::DcompSurface;
 pub use desktop::{
     BandState, DesktopHost, PlatformError, ProbeReport, Strategy, TopLevelBottom, WorkerWInfo,
 };

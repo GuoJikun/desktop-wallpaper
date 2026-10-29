@@ -43,6 +43,9 @@ pub const TEST_RGB: [u8; 3] = [0xD0, 0x30, 0x30];
 /// 窗口类名。必须是全局唯一的常量，改名等于换一类窗口。
 pub const WINDOW_CLASS: &str = "WallpaperHostWindow";
 
+/// `WS_EX_NOREDIRECTIONBITMAP`：不分配重定向表面，内容只能由 DComp 提供。
+pub const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
+
 #[derive(Debug, Clone, Copy)]
 pub struct HostWindowSpec {
     pub rect: PhysicalRect,
@@ -57,6 +60,16 @@ impl HostWindowSpec {
             ex_style: HOST_EX_STYLE,
             style: HOST_STYLE,
         }
+    }
+
+    /// 打开后 GDI 绘制必然无效，内容必须走 [`crate::DcompSurface`]。
+    pub fn with_noredirection_bitmap(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.ex_style |= WS_EX_NOREDIRECTIONBITMAP;
+        } else {
+            self.ex_style &= !WS_EX_NOREDIRECTIONBITMAP;
+        }
+        self
     }
 }
 

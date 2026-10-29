@@ -5,6 +5,7 @@
 pub mod probe;
 pub mod progman;
 pub mod toplevel;
+pub mod workerw;
 
 use wp_core::MonitorKey;
 
@@ -25,11 +26,13 @@ pub enum Strategy {
 }
 
 impl Strategy {
-    /// M0 探测矩阵要跑的全部策略（WorkerW 仅作旧系统回退，不参与）。
-    pub const ALL: [Self; 3] = [
+    /// M0 探测矩阵要跑的全部策略，含 WorkerW——即使 26H2 上预期失败，
+    /// 也要实测出「失败在握手还是失败在合成」。
+    pub const ALL: [Self; 4] = [
         Self::ProgmanChild,
         Self::TopLevelBottom,
         Self::TopLevelAnchored,
+        Self::WorkerW,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -52,9 +55,7 @@ impl Strategy {
             Self::TopLevelAnchored => Err(PlatformError::Unsupported(
                 "精确插入 DefView 相邻位待实现（M0 第 3 步）",
             )),
-            Self::WorkerW => Err(PlatformError::Unsupported(
-                "26H2 上不存在 WorkerW 宿主，策略 D 仅作旧系统回退",
-            )),
+            Self::WorkerW => Ok(Box::new(workerw::WorkerWHost::new()?)),
         }
     }
 }
