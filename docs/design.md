@@ -98,10 +98,12 @@ pub trait DesktopHost: Send {
 
 | ID | 策略 | 适用 | 状态 |
 |---|---|---|---|
-| A | `Progman` 子窗口 + DirectComposition visual | 24H2+ 理论路线 | 待验证 |
-| B | 顶层窗口置底（`HWND_BOTTOM`） | 26H2 实测可显示 | 待验证稳定性 |
+| A | `Progman` 子窗口 + DirectComposition visual | 24H2+ 理论路线 | GDI 内容已证否（不可见）；待测 DComp + `WS_EX_NOREDIRECTIONBITMAP` |
+| B | 顶层窗口置底（`HWND_BOTTOM`） | 26H2 实测可显示 | 画面可见，但**盖住桌面图标**；看门狗已验证可在 6 s 内修正漂移 |
 | C | 顶层窗口精确插入 `DefView` 相邻位 | 26H2 备选 | 待验证 |
 | D | `WorkerW` 子窗口 | Win10 / 22H2–23H2 | 已知可用（旧系统） |
+
+**实测数据来源**：`.opencode/plans/wallpaper-probe-26h2.md` §6（`wpctl probe --minimize --shot` 截图判定）。
 
 **探测顺序**：A → C → B → D。选择依据不是"能 attach"，而是"attach 后画面可见 + 图标在上 + 输入正常"三项同时成立。
 

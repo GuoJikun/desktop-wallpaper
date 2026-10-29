@@ -139,3 +139,31 @@ SendMessageTimeout(Progman, 0x052C, wParam=0xD, lParam=0) -> ret=1
 - [ ] 锁屏 / 解锁、RDP 连接断开重连
 - [ ] 全屏独占游戏 / `SHQueryUserNotificationState` 的暂停判定
 - [ ] 长时间（≥ 30 分钟）稳定性与 CPU/GPU 占用
+
+---
+
+## 6. Rust 复核（2026-10-29，`wpctl` 实测）
+
+用 `crates/wp-platform` + `wpctl probe --minimize --shot` 把上面的结论重新跑了一遍，
+这次判定依据是截图和像素统计，不再依赖肉眼与 PowerShell 脚本。
+
+| 策略 | 内容 | attach | 层级自愈 | 截图结果 | 结论 |
+|---|---|---|---|---|---|
+| B 顶层置底 | GDI 纯色 | ok | 6 s 内修正 1 次 | 测试色 **95.6%**，图标区 400×300 异色像素 **0** | 画面可见，但**盖住桌面图标** |
+| A Progman 子窗口 | GDI 纯色 | ok | 无需修正 | 测试色 **0%**，桌面原样（原壁纸 + 图标都在） | 内容**完全不参与合成**，与 PowerShell 结论一致 |
+
+补充事实：
+
+- `SetWindowPos(HWND_BOTTOM)` 之后，窗口在顶层 z 链中的索引恰好是 `Progman 索引 - 1`：
+  **`HWND_BOTTOM` 只能压到「紧贴 Progman 之上」，压不到 Progman 之下**。
+  因此「层级正确」的判据改成「紧贴桌面上方」，见 `desktop/toplevel.rs`。
+- `WindowFromPoint` 会跳过 `WS_EX_TRANSPARENT` 窗口，所以命中 `SysListView32`
+  **不能**用来证明图标在上层；判断可见性必须截图。
+- 策略 B 的 6 秒里出现过 1 次 z 序漂移并被 `ensure_band` 修正，证明看门狗是必要且有效的。
+
+下一步（M0 剩余关键格）：
+
+1. 策略 A + `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition visual —— 这是让 Progman 子窗口
+   内容进入 DWM 合成的标准做法，最有可能同时满足「不盖图标」和「可见」。
+2. 策略 B + D3D11 交换链，比较 z 带漂移频率是否比 GDI 更低。
+

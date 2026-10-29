@@ -3,6 +3,7 @@
 //! 26H2 实测结论见 `.opencode/plans/wallpaper-probe-26h2.md`。
 
 pub mod probe;
+pub mod progman;
 pub mod toplevel;
 
 use wp_core::MonitorKey;
@@ -47,9 +48,7 @@ impl Strategy {
     pub fn open(self) -> Result<Box<dyn DesktopHost>> {
         match self {
             Self::TopLevelBottom => Ok(Box::new(TopLevelBottom::new()?)),
-            Self::ProgmanChild => Err(PlatformError::Unsupported(
-                "Progman 子窗口 + DirectComposition 待实现（M0 第 3 步）",
-            )),
+            Self::ProgmanChild => Ok(Box::new(progman::ProgmanChild::new()?)),
             Self::TopLevelAnchored => Err(PlatformError::Unsupported(
                 "精确插入 DefView 相邻位待实现（M0 第 3 步）",
             )),
