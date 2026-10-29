@@ -19,9 +19,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::desktop::{PlatformError, Result};
 use crate::window::raw;
 
-/// 弹出菜单的标准窗口类名。
-const MENU_CLASS: &str = "#32768";
-
 /// 在屏幕坐标 `(x, y)` 处模拟一次右键单击。
 pub fn right_click(x: i32, y: i32) -> Result<()> {
     let (vx, vy, vw, vh) = unsafe {

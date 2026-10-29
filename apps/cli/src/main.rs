@@ -84,6 +84,11 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // 上一次异常退出可能把图标层留在了别的窗口下，先修桌面再干别的。
+    if let Some(healed) = wp_platform::heal_desktop() {
+        eprintln!("[桌面自愈] {healed}");
+    }
+
     match Cli::parse().command {
         Cmd::Probe {
             json,

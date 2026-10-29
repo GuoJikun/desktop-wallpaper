@@ -10,6 +10,7 @@ pub mod workerw;
 
 use wp_core::MonitorKey;
 
+pub use adopt::heal_desktop;
 pub use probe::{probe, ProbeReport, WorkerWInfo};
 pub use toplevel::TopLevelBottom;
 

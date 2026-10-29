@@ -11,6 +11,8 @@
 //! 让图标层变成我们的子窗口。这样壁纸画在父窗口上，图标画在子窗口上，
 //! 两者天然叠在一起，而且不需要和 `Progman` 抢 z 序。
 //!
+//! 26H2 实测结果：壁纸铺满、图标正常显示、右键菜单/单击/双击全部正常。
+//!
 //! 风险：这是跨进程改变 Explorer 的窗口树。任何一步失败都必须把 `DefView`
 //! 还原回 `Progman`，否则桌面会没有图标（`explorer.exe` 重启可恢复）。
 
@@ -52,7 +54,7 @@ impl DefViewAdopt {
         self.corrections
     }
 
-    /// 把 DefView 挂到 `host` 下并铺满；`host` 为 0 表示还原给 Progman。
+    /// 把 DefView 挂到 `host` 下并铺满；`host` 为空表示还原给 Progman。
     fn adopt(&mut self, host: HWND, rect: PhysicalRect) -> Result<()> {
         let defview = raw(self.defview);
         let target = if host.0.is_null() {
@@ -71,12 +73,14 @@ impl DefViewAdopt {
             rect.height as i32,
         );
 
-        let flags = SET_WINDOW_POS_FLAGS(
-            SWP_NOACTIVATE.0 | SWP_NOOWNERZORDER.0 | SWP_SHOWWINDOW.0,
-        );
-        unsafe { SetParent(defview, Some(target)) }
-            .map_err(|e| win32("SetParent(DefView)", e))?;
-        let after = if host.0.is_null() { HWND_BOTTOM } else { HWND_TOP };
+        let flags =
+            SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOOWNERZORDER.0 | SWP_SHOWWINDOW.0);
+        unsafe { SetParent(defview, Some(target)) }.map_err(|e| win32("SetParent(DefView)", e))?;
+        let after = if host.0.is_null() {
+            HWND_BOTTOM
+        } else {
+            HWND_TOP
+        };
         unsafe { SetWindowPos(defview, Some(after), x, y, w, h, flags) }
             .map_err(|e| win32("SetWindowPos(DefView)", e))?;
         Ok(())
@@ -108,7 +112,7 @@ impl DesktopHost for DefViewAdopt {
 
     fn attach(&mut self, hwnd: isize, rect: PhysicalRect) -> Result<()> {
         let host = raw(hwnd);
-        if !unsafe { IsWindow(Some(host)).as_bool() } {
+        if !unsafe { IsWindow(Some(host)) }.as_bool() {
             return Err(PlatformError::Unsupported("attach 传入的窗口句柄无效"));
         }
 
@@ -127,11 +131,22 @@ impl DesktopHost for DefViewAdopt {
 
     fn ensure_band(&mut self, hwnd: isize) -> Result<BandState> {
         let host = raw(hwnd);
-        let defview = raw(self.defview);
-        if !unsafe { IsWindow(Some(host)).as_bool() }
-            || !unsafe { IsWindow(Some(defview)) }.as_bool()
-        {
+        if !unsafe { IsWindow(Some(host)) }.as_bool() {
             return Ok(BandState::Lost);
+        }
+
+        // Explorer 重启会把 DefView 换掉，旧句柄失效就重新找一遍再挂。
+        let defview = raw(self.defview);
+        if !unsafe { IsWindow(Some(defview)) }.as_bool() {
+            let progman = probe::progman().ok_or(PlatformError::NoDesktopHost)?;
+            let Some(next) = find_defview(progman) else {
+                return Ok(BandState::Lost);
+            };
+            self.progman = progman.0 as isize;
+            self.defview = next.0 as isize;
+            self.adopt(host, self.rect)?;
+            self.corrections += 1;
+            return Ok(BandState::Corrected);
         }
 
         // 父窗口不是我们，或者被隐藏了，就重新挂一次。
@@ -159,6 +174,41 @@ fn find_defview(progman: HWND) -> Option<HWND> {
     probe::top_level_windows()
         .into_iter()
         .find_map(|h| probe::find_child(h, "SHELLDLL_DefView", None))
+}
+
+/// 自愈：如果图标层被上一次异常退出留在了别的父窗口下，把它还给 `Progman`。
+///
+/// 渲染进程崩溃时 `Drop` 不会执行，下次启动必须先修复桌面，再谈挂壁纸。
+pub fn heal_desktop() -> Option<String> {
+    let progman = probe::progman()?;
+    let defview = find_defview(progman)?;
+    let parent = unsafe { GetParent(defview) }.ok()?;
+    if parent == progman {
+        return None;
+    }
+    let mut pr = windows::Win32::Foundation::RECT::default();
+    unsafe { GetWindowRect(progman, &mut pr) }.ok()?;
+    let flags = SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOOWNERZORDER.0 | SWP_SHOWWINDOW.0);
+    let result = unsafe {
+        SetParent(defview, Some(progman))
+            .and_then(|_| {
+                SetWindowPos(
+                    defview,
+                    Some(HWND_BOTTOM),
+                    pr.left,
+                    pr.top,
+                    pr.right - pr.left,
+                    pr.bottom - pr.top,
+                    flags,
+                )
+            })
+    };
+    match result {
+        Ok(()) => Some(format!(
+            "图标层被挂到了 {parent:?}，已还原给 Progman"
+        )),
+        Err(e) => Some(format!("图标层还原失败: {}", win32("heal", e))),
+    }
 }
 
 fn win32(context: &'static str, e: windows::core::Error) -> PlatformError {
