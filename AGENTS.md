@@ -148,6 +148,9 @@ M0 验收细则：
 
 ## 5. 环境约束
 
+- **Shell 一律用 pwsh 7**（`D:\software\PowerShell\7\pwsh.EXE`）。禁止调用 `powershell.exe`（5.1），
+  它的管道编码与语法差异会让输出乱码、脚本失效。涉及中文输出时先设置
+  `[Console]::OutputEncoding = [Text.Encoding]::UTF8`。
 - **GT 720 / 2 GB**：仅 H.264 硬解，无 VP9/AV1/HEVC 硬解，无 NVENC → 首版按 1080p H.264 定标，导入时做能力检测。
 - WebView2 156.x 已安装，可直接用。
 - 现有可复用脚手架：`E:\private\Rust\aweak`（托盘 / 自启 / 配置 / 崩溃处理 / 单实例 / 电源事件），可抽成公共 crate，省约一周。
@@ -158,6 +161,7 @@ M0 验收细则：
 
 ```bash
 cargo run -p wpctl -- probe --strategy all --duration 60
+cargo run -p wpctl -- probe --strategy toplevel_bottom --minimize --shot out\shot.bmp
 cargo run -p wpctl -- attach --monitor 0 --source <file|url>
 cargo run -p wpctl -- pause
 cargo tauri dev   # 在 apps/desktop 下
