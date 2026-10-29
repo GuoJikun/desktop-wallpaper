@@ -170,10 +170,16 @@ M0 验收细则：
 ## 6. 常用命令（约定）
 
 ```bash
-cargo run -p wpctl -- probe --strategy all --duration 60
-cargo run -p wpctl -- probe --strategy toplevel_bottom --minimize --shot out\shot.bmp
+# M0 主力策略：反向接管 DefView，截图 + 人工输入验证
+cargo run -p wpctl -- probe --strategy defview_adopt --content d3d --duration 60 --minimize --shot out\adopt.bmp
+# 判别实验：Progman 子窗口在 DefView 之上 / 之下
+cargo run -p wpctl -- probe --strategy progman_child_top --content d3d --duration 10 --minimize --shot out\a_top.bmp
+# 全矩阵（含已证否策略，用于回归）
+cargo run -p wpctl -- probe --strategy all --duration 30
+# 桌面输入基线（不带壁纸）
+cargo run -p wpctl -- input-test --minimize
+cargo run -p wpctl -- shot --out out\shot.bmp
 cargo run -p wpctl -- attach --monitor 0 --source <file|url>
-cargo run -p wpctl -- pause
 cargo tauri dev   # 在 apps/desktop 下
 ```
 

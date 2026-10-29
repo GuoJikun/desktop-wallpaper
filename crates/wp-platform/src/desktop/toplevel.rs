@@ -124,7 +124,7 @@ impl DesktopHost for TopLevelBottom {
 /// 注意：`Progman` 永远占据 z 链最后一个位置，`HWND_BOTTOM` 也无法把窗口
 /// 放到它下面——实测压到底后索引恰好是 `anchor - 1`。因此「层级正确」
 /// 的定义是「紧贴桌面上方且下面没有别的窗口」，而不是「在桌面下方」。
-fn is_at_bottom_of_band(a: HWND, anchor: HWND) -> bool {
+pub(crate) fn is_at_bottom_of_band(a: HWND, anchor: HWND) -> bool {
     match (z_index(a), z_index(anchor)) {
         (Some(ia), Some(ib)) => ia + 1 == ib,
         // 任一方不在顶层 z 链里，视为层级未知。

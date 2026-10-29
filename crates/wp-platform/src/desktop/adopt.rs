@@ -86,6 +86,24 @@ impl DefViewAdopt {
         Ok(())
     }
 
+    /// 把宿主窗口压到桌面之上、其它窗口之下。
+    fn place_bottom(&self, host: HWND) -> Result<()> {
+        let flags =
+            SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOOWNERZORDER.0 | SWP_SHOWWINDOW.0);
+        unsafe {
+            SetWindowPos(
+                host,
+                Some(HWND_BOTTOM),
+                self.rect.x,
+                self.rect.y,
+                self.rect.width as i32,
+                self.rect.height as i32,
+                flags,
+            )
+        }
+        .map_err(|e| win32("SetWindowPos(host)", e))
+    }
+
     /// 还原：DefView 还给 Progman，并铺满整个屏。
     fn restore(&mut self, rect: PhysicalRect) -> Result<()> {
         if self.defview == 0 {
@@ -126,7 +144,9 @@ impl DesktopHost for DefViewAdopt {
 
         self.rect = rect;
         self.host = hwnd;
-        self.adopt(host, rect)
+        self.adopt(host, rect)?;
+        // 壁纸必须在其它应用之下，否则会挡住用户正在用的窗口。
+        self.place_bottom(host)
     }
 
     fn ensure_band(&mut self, hwnd: isize) -> Result<BandState> {
@@ -155,6 +175,17 @@ impl DesktopHost for DefViewAdopt {
         if parent != Some(host) || !visible {
             self.adopt(host, self.rect)?;
             self.corrections += 1;
+            return Ok(BandState::Corrected);
+        }
+
+        // z 序被前台切换推到桌面上方时，重新压回底部。
+        let progman = raw(self.progman);
+        if !super::toplevel::is_at_bottom_of_band(host, progman) {
+            self.place_bottom(host)?;
+            self.corrections += 1;
+            if !super::toplevel::is_at_bottom_of_band(host, progman) {
+                return Ok(BandState::Lost);
+            }
             return Ok(BandState::Corrected);
         }
         Ok(BandState::Correct)
