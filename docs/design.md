@@ -98,14 +98,26 @@ pub trait DesktopHost: Send {
 
 | ID | 策略 | 适用 | 状态 |
 |---|---|---|---|
-| A | `Progman` 子窗口 + DirectComposition visual | 24H2+ 理论路线 | GDI 内容已证否（不可见）；待测 DComp + `WS_EX_NOREDIRECTIONBITMAP` |
-| B | 顶层窗口置底（`HWND_BOTTOM`） | 26H2 实测可显示 | 画面可见，但**盖住桌面图标**；看门狗已验证可在 6 s 内修正漂移 |
-| C | 顶层窗口精确插入 `DefView` 相邻位 | 26H2 备选 | 待验证 |
-| D | `WorkerW` 子窗口 | Win10 / 22H2–23H2 | 已知可用（旧系统） |
+| **E** | **反向接管 `SHELLDLL_DefView`（把图标层挂成自己的子窗口）** | **26H2 主力方案** | **实测通过：壁纸 99.1% 铺满 + 图标正常 + 右键/单击/双击全部正常** |
+| A | `Progman` 子窗口（DefView 之下） | 24H2+ 理论路线 | 已证否：GDI 与 DComp 内容都被 DefView 完全盖住（测试色 0%） |
+| A′ | `Progman` 子窗口（DefView 之上） | 诊断用 | 可见（93.6%）但盖住所有图标，仅用于判别实验 |
+| B | 顶层窗口置底（`HWND_BOTTOM`） | 26H2 可显示 | 画面可见，但盖住桌面图标；z 序会漂移，需看门狗 |
+| C | 顶层窗口精确插入 `DefView` 相邻位 | 26H2 备选 | 未实现（分界在 DefView，结构性不可行，优先级下调） |
+| D | `WorkerW` 子窗口 | Win10 / 22H2–23H2 | 26H2 上 `0x052C`（wParam=0 与 0xD）均返回 0，不产生宿主窗口 |
 
-**实测数据来源**：`.opencode/plans/wallpaper-probe-26h2.md` §6（`wpctl probe --minimize --shot` 截图判定）。
+**关键结论**：26H2 上「壁纸可见」与「图标可见」的分界线就是 `SHELLDLL_DefView`。
+`Progman` 的子窗口只能落在分界线的某一侧，因此策略 A 在结构上无法同时满足两者；
+唯一能同时满足的是「把 DefView 反向挂到自己的窗口下」（策略 E）。
 
-**探测顺序**：A → C → B → D。选择依据不是"能 attach"，而是"attach 后画面可见 + 图标在上 + 输入正常"三项同时成立。
+**实测数据来源**：`.opencode/plans/wallpaper-probe-26h2.md` §6–§7（`wpctl probe --minimize --shot` 截图判定 + 人工点击验证）。
+
+**选择顺序**：E → B（降级）→ A′（仅诊断）。判据不是"能 attach"，而是"画面可见 + 图标在上 + 输入正常"三项同时成立。
+
+**策略 E 实现约束**（违反任一条都会退化为黑屏或盖图标）：
+
+1. DComp `CreateTargetForHwnd(hwnd, topmost)` 必须传 `false`，否则 visual 盖住子窗口里的图标。
+2. 宿主窗销毁前必须先 `SetParent(DefView → Progman)`；`DestroyWindow` 会带走子窗口。
+3. 进程启动时调用 `heal_desktop()`，修复上次异常退出遗留的窗口树；`Drop` 只能兜住正常路径。
 
 ### 3.4 状态机
 
@@ -426,11 +438,12 @@ SQLite 开 WAL；迁移用版本号 + 顺序脚本（`PRAGMA user_version`）。
 
 | ID | 决策 | 理由 | 影响 |
 |---|---|---|---|
-| ADR-001 | 放弃 `WorkerW` 宿主 | 26H2 实测不再产生 | 需多策略探测 |
+| ADR-001 | 放弃 `WorkerW` 宿主 | 26H2 实测不再产生（wParam=0 / 0xD 均无效） | 需多策略探测 |
 | ADR-002 | 桌面内容必须走 D3D/DComp | GDI 子窗口实测黑屏 | 后端不允许 GDI 绘制 |
 | ADR-003 | 每显示器独立进程 | 崩溃/显存隔离 | IPC 复杂度上升 |
 | ADR-004 | 视频先用外部 mpv.exe | 规避 GPL 链接风险 | 多一个进程，M0 后复核 |
 | ADR-005 | 网页壁纸独立 WebView2 配置目录 | 安全隔离 | 磁盘占用增加 |
+| ADR-006 | 26H2 采用「反向接管 `SHELLDLL_DefView`」 | 分界线在 DefView，Progman 子窗口只能落一侧 | 必须 detach + 启动自愈，且 DComp visual 不得 topmost |
 
 ---
 
@@ -438,8 +451,9 @@ SQLite 开 WAL；迁移用版本号 + 顺序脚本（`PRAGMA user_version`）。
 
 这些假设会在 M0 被证实或推翻，设计需保持可切换：
 
-- [ ] A 策略（Progman 子窗口 + DirectComposition）在 26H2 可行
-- [ ] B/C 策略的 z 序漂移可通过 `ensure_band` 完全收敛
-- [ ] `WM_NCHITTEST → HTTRANSPARENT` 足以让桌面完全可用
+- [x] ~~A 策略（Progman 子窗口 + DirectComposition）在 26H2 可行~~ → **已推翻**：内容永远落在 DefView 的一侧
+- [x] ~~`WM_NCHITTEST → HTTRANSPARENT` 足以让桌面完全可用~~ → **已验证**（策略 E，人工确认右键/单击/双击）
+- [x] ~~B/C 策略的 z 序漂移可通过 `ensure_band` 完全收敛~~ → **部分**：漂移可修正，但 B 会盖住图标，不能作为最终方案
 - [ ] mpv `--wid` 嵌入在置底窗口上能正常输出（D3D 交换链 vs 窗口 surface）
 - [ ] 多屏 + 混合 DPI 下窗口矩形计算无需特殊处理
+- [ ] Explorer 重启后策略 E 能自动重挂（代码已实现，未实测）

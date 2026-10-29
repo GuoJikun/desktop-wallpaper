@@ -167,3 +167,54 @@ SendMessageTimeout(Progman, 0x052C, wParam=0xD, lParam=0) -> ret=1
    内容进入 DWM 合成的标准做法，最有可能同时满足「不盖图标」和「可见」。
 2. 策略 B + D3D11 交换链，比较 z 带漂移频率是否比 GDI 更低。
 
+---
+
+## 7. M0 结论：DefView 接管（策略 E）
+
+### 7.1 判别实验（为什么 A / B / D 都不行）
+
+| 实验 | 内容 | 测试色占比 | 图标区异色像素 | 结论 |
+|---|---|---|---|---|
+| A 子窗口在 DefView **之下** | D3D11 + DComp | 0.0% | 120000 | 完全被 DefView 盖住 |
+| A 子窗口在 DefView **之上** | D3D11 + DComp | **93.6%** | 0 | 合成本身没问题，是 DefView 挡住我们 |
+| D WorkerW（wParam=0） | — | — | — | `0x052C` 返回 0，不产生宿主窗口，与 `0xD` 一致 |
+
+由此确定：**26H2 上「壁纸可见」与「图标可见」的分界线就是 `SHELLDLL_DefView` 这一层**。
+`Progman` 的子窗口永远处在分界线的某一侧，所以策略 A 在结构上不可能同时满足两者。
+
+### 7.2 策略 E 做法
+
+把自己的窗口（顶层、置底、`WS_EX_TRANSPARENT` + `WM_NCHITTEST → HTTRANSPARENT`）
+当作容器，把 `SHELLDLL_DefView` **反向** 挂进来：
+
+```
+我们的宿主窗口（壁纸：GDI / D3D11+DComp）
+  └─ SHELLDLL_DefView（图标，Explorer 自己的窗口）
+       └─ SysListView32
+```
+
+- 壁纸画在父窗口 → 铺满屏；
+- 图标是子窗口 → 天然在壁纸之上，颜色、选中、双击全部走 Explorer 原逻辑；
+- 退出时 `SetParent(DefView → Progman)` 还原，`Drop` 兜底，启动时 `heal_desktop()` 自愈。
+
+### 7.3 实测结果
+
+| 项目 | GDI 纯色 | D3D11 + DComp |
+|---|---|---|
+| 测试色占比 | 98.9% | **99.1%** |
+| 图标区（400×300）异色像素 | 7855 | 5603 |
+| 右键菜单 / 单击图标 / 双击图标 | — | **全部正常（人工确认）** |
+| 150 秒稳定性 | — | 检查 75 次，修正 0，丢失 0 |
+
+关键细节：DComp 的 `CreateTargetForHwnd(hwnd, topmost)` 必须传 **`false`**。
+`topmost = true` 时 visual 会盖住子窗口，实测图标区异色像素变成 0（图标全被盖住）。
+
+### 7.4 仍待验证
+
+- [ ] Explorer 重启（`TaskbarCreated`）后重挂 —— 代码已实现，未实测
+- [ ] 多显示器 / 混合 DPI
+- [ ] 锁屏解锁、RDP 重连
+- [ ] 全屏独占游戏时的暂停判定
+- [ ] 长时间（≥ 30 分钟）稳定性与 GPU 占用
+
+
