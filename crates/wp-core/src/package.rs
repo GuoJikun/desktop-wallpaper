@@ -124,7 +124,8 @@ mod tests {
 
     #[test]
     fn rejects_traversal() {
-        for evil in ["../secret.txt", "C:\\Windows\\win.ini", "/etc/passwd"] {
+        // 注意：这是 JSON 文本，反斜杠必须成对转义（Rust 层是 `\\\\`）。
+        for evil in ["../secret.txt", "C:\\\\Windows\\\\win.ini", "/etc/passwd"] {
             let bad = OK.replace("content/index.html", evil);
             let err = Manifest::parse(&bad).unwrap_err();
             assert!(
@@ -132,6 +133,24 @@ mod tests {
                 "{evil} 应被拒绝，实际: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_traversal_without_json_layer() {
+        // 直接测路径校验，排除 JSON 转义带来的假通过。
+        for evil in [
+            PathBuf::from("../secret.txt"),
+            PathBuf::from("C:\\Windows\\win.ini"),
+            PathBuf::from("/etc/passwd"),
+            PathBuf::from("content/../../escape"),
+        ] {
+            assert!(
+                matches!(validate_relative_path(&evil), Err(PackageError::PathTraversal(_))),
+                "{} 应被拒绝",
+                evil.display()
+            );
+        }
+        assert!(validate_relative_path(Path::new("content/index.html")).is_ok());
     }
 
     #[test]
