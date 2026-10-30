@@ -20,8 +20,9 @@ pub use desktop::{
 pub use monitor::{enumerate_monitors, MonitorInfo};
 pub use window::{
     class_at_point, create_host_window, describe, destroy_host_window, is_host_window_alive,
-    is_minimized, minimize_other_windows, paint_solid, pump_messages, restore_leaked_windows,
-    restore_window, restore_windows, HostWindowSpec, TEST_COLOR, TEST_RGB, WINDOW_CLASS,
+    is_minimized, minimize_other_windows, move_host_window, paint_solid, pump_messages,
+    restore_leaked_windows, restore_window, restore_windows, HostWindowSpec, TEST_COLOR, TEST_RGB,
+    WINDOW_CLASS,
 };
 
 /// 桌面宿主窗口的推荐扩展样式。

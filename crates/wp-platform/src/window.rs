@@ -20,11 +20,10 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
     GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible,
-    PeekMessageW, RegisterClassExW, ShowWindow, TranslateMessage, WindowFromPoint, GWL_EXSTYLE,
-    GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE, SW_MINIMIZE, SW_RESTORE,
-    WINDOW_EX_STYLE,
-    WINDOW_STYLE, WNDCLASSEXW, WNDCLASS_STYLES, WM_ERASEBKGND, WM_NCHITTEST,
+    IsWindow, IsWindowVisible, PeekMessageW, RegisterClassExW, SetWindowPos, ShowWindow,
+    TranslateMessage, WindowFromPoint, GWL_EXSTYLE, GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE,
+    SET_WINDOW_POS_FLAGS, SW_MINIMIZE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WNDCLASS_STYLES, WM_ERASEBKGND, WM_NCHITTEST,
 };
 
 use wp_core::PhysicalRect;
@@ -136,6 +135,26 @@ pub fn destroy_host_window(hwnd: isize) {
     unsafe {
         let _ = DestroyWindow(raw(hwnd));
     }
+}
+
+/// 把宿主窗口移到新的显示器矩形。
+///
+/// 显示器热插拔 / 分辨率变化后 `WM_DISPLAYCHANGE` 会带着新几何过来；
+/// 窗口必须跟着走，否则壁纸只覆盖旧区域，`DefView` 也会按旧矩形摆放。
+pub fn move_host_window(hwnd: isize, rect: PhysicalRect) -> Result<()> {
+    let flags = SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOZORDER.0 | SWP_SHOWWINDOW.0);
+    unsafe {
+        SetWindowPos(
+            raw(hwnd),
+            None,
+            rect.x,
+            rect.y,
+            rect.width as i32,
+            rect.height as i32,
+            flags,
+        )
+    }
+    .map_err(|e| win32("SetWindowPos(host)", e.code().0 as u32))
 }
 
 /// 句柄是否仍然有效。
@@ -350,13 +369,21 @@ fn window_pid(hwnd: isize) -> u32 {
 /// 只看 `OpenProcess` 成功是不够的：只要还有别的进程持有它的句柄，
 /// 已退出的进程对象仍然可以被打开（PID 也不会被回收），会被误判成活着。
 /// 必须再用 `WaitForSingleObject(handle, 0)` 判断是否已经终止。
+///
+/// 注意句柄权限必须带 `SYNCHRONIZE`：只给 `PROCESS_QUERY_LIMITED_INFORMATION` 时
+/// `WaitForSingleObject` 会返回 `WAIT_FAILED`（实测 0xFFFFFFFF），于是**活进程也被判成死的**。
+/// 这个 bug 会让 `heal_desktop` 把图标层从正在运行的 wp-host 手里抢回去。
 pub(crate) fn process_alive(pid: u32) -> bool {
     use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     unsafe {
-        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+        match OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        ) {
             Ok(handle) => {
                 let wait = WaitForSingleObject(handle, 0);
                 let _ = CloseHandle(handle);
@@ -526,5 +553,29 @@ mod tests {
         assert!(is_host_window_alive(hwnd));
         destroy_host_window(hwnd);
         assert!(!is_host_window_alive(hwnd), "销毁后句柄应失效");
+    }
+
+    /// 回归：句柄缺 `SYNCHRONIZE` 时 `WaitForSingleObject` 返回 `WAIT_FAILED`，
+    /// 活进程会被误判成死的，`heal_desktop` 于是抢走正在使用的图标层。
+    #[test]
+    fn process_alive_detects_running_then_exited_child() {
+        use std::process::{Command, Stdio};
+
+        let Ok(mut child) = Command::new("cmd")
+            .args(["/c", "timeout", "/t", "30", "/nobreak"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            eprintln!("跳过：无法启动子进程");
+            return;
+        };
+
+        assert!(process_alive(child.id()), "正在运行的子进程应判定为存活");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!process_alive(child.id()), "已退出的子进程应判定为死亡");
     }
 }

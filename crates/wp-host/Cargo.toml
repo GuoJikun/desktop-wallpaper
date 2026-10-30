@@ -15,5 +15,14 @@ wp-ipc.workspace = true
 wp-platform.workspace = true
 wp-render.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_RemoteDesktop",
+    "Win32_UI_WindowsAndMessaging",
+] }

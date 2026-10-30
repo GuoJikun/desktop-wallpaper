@@ -70,6 +70,9 @@ enum Cmd {
         /// 显示器索引
         #[arg(long, default_value_t = 0)]
         monitor: usize,
+        /// 截图前最小化其它窗口，截完恢复（把桌面亮出来）
+        #[arg(long)]
+        minimize: bool,
     },
     /// 挂载一张壁纸到指定显示器（M0 第 3 步后可用）
     Attach {
@@ -137,7 +140,11 @@ fn main() -> Result<()> {
             },
             monitor,
         ),
-        Cmd::Shot { out, monitor } => shot_once(&out, monitor),
+        Cmd::Shot {
+            out,
+            monitor,
+            minimize,
+        } => shot_once(&out, monitor, minimize),
         Cmd::InputTest { minimize, monitor } => {
             let monitors = wp_platform::enumerate_monitors();
             let rect = monitors
@@ -225,17 +232,28 @@ fn probe(
     Ok(())
 }
 
-fn shot_once(out: &Path, monitor_idx: usize) -> Result<()> {
+fn shot_once(out: &Path, monitor_idx: usize, minimize: bool) -> Result<()> {
     let monitors = wp_platform::enumerate_monitors();
     let monitor = monitors
         .get(monitor_idx)
         .with_context(|| format!("显示器索引 {monitor_idx} 不存在（共 {} 台）", monitors.len()))?;
+
+    // 只最小化，不隐藏：隐藏的窗口会从任务栏 / Alt+Tab 消失，进程一死就回不来。
+    let guard = RestoreGuard::new(if minimize {
+        let handles = wp_platform::minimize_other_windows();
+        std::thread::sleep(Duration::from_millis(500));
+        handles
+    } else {
+        Vec::new()
+    });
 
     let image = wp_platform::capture(monitor.rect)?;
     wp_platform::save_bmp(out, &image)
         .with_context(|| format!("保存 {} 失败", out.display()))?;
 
     let ratio = image.ratio_of(wp_platform::TEST_RGB);
+    guard.release();
+
     println!(
         "已截屏 {}（{}x{}），测试色占比 {:.2}%",
         out.display(),

@@ -332,6 +332,15 @@ pub fn resize_defview(x: i32, y: i32, w: i32, h: i32) -> bool {
 pub fn heal_desktop() -> Option<String> {
     let marker = read_marker();
 
+    // 另一个 wp-host 正在接管：它的 DefView 本来就不在 Progman 下，
+    // 这时候「修桌面」等于把图标层从正在运行的宿主手里抢走（壁纸当场消失）。
+    // 只有记录里的进程已经退出，才轮到我们收拾残局。
+    if let Some((owner_pid, _)) = marker {
+        if owner_pid != std::process::id() && crate::window::process_alive(owner_pid) {
+            return None;
+        }
+    }
+
     if let Some(progman) = probe::progman() {
         if let Some(defview) = find_defview(progman) {
             let parent = unsafe { GetParent(defview) }.ok();

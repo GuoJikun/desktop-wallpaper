@@ -110,7 +110,7 @@ pub fn capture(rect: PhysicalRect) -> Result<ScreenImage, PlatformError> {
             mem_dc, 0, 0, width, height, Some(screen_dc), rect.x, rect.y, rop,
         );
 
-        let stride = ((width as u32 * 3 + 3) / 4) * 4;
+        let stride = (width as u32 * 3).div_ceil(4) * 4;
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
