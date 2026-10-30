@@ -3,6 +3,7 @@
 //! 26H2 实测结论见 `.opencode/plans/wallpaper-probe-26h2.md`。
 
 pub mod adopt;
+pub mod defview_child;
 pub mod probe;
 pub mod progman;
 pub mod toplevel;
@@ -10,9 +11,10 @@ pub mod workerw;
 
 use wp_core::MonitorKey;
 
-pub use adopt::{defview_state, heal_desktop, resize_defview};
+pub use adopt::{defview_handle, defview_state, heal_desktop, resize_defview};
+pub use defview_child::DefViewChild;
 pub use probe::{probe, ProbeReport, WorkerWInfo};
-pub use toplevel::TopLevelBottom;
+pub use toplevel::{z_chain, TopLevelBottom};
 
 /// 桌面宿主策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +31,8 @@ pub enum Strategy {
     WorkerW,
     /// 反向接管：把 `SHELLDLL_DefView` 挂到自己窗口下。
     DefViewAdopt,
+    /// 反向挂载：自己挂到 `SHELLDLL_DefView` 下，压在图标之下。
+    DefViewChild,
 }
 
 impl Strategy {
@@ -49,6 +53,7 @@ impl Strategy {
             Self::TopLevelAnchored => "toplevel_anchored",
             Self::WorkerW => "workerw",
             Self::DefViewAdopt => "defview_adopt",
+            Self::DefViewChild => "defview_child",
         }
     }
 
@@ -66,6 +71,7 @@ impl Strategy {
             )),
             Self::WorkerW => Ok(Box::new(workerw::WorkerWHost::new()?)),
             Self::DefViewAdopt => Ok(Box::new(adopt::DefViewAdopt::new()?)),
+            Self::DefViewChild => Ok(Box::new(defview_child::DefViewChild::new()?)),
         }
     }
 }
@@ -81,9 +87,10 @@ impl std::str::FromStr for Strategy {
             "toplevel_anchored" => Ok(Self::TopLevelAnchored),
             "workerw" => Ok(Self::WorkerW),
             "defview_adopt" => Ok(Self::DefViewAdopt),
+            "defview_child" => Ok(Self::DefViewChild),
             other => Err(PlatformError::Unsupported(match other {
                 "all" => "all 不是单条策略名",
-                _ => "未知策略名（progman_child / progman_child_top / toplevel_bottom / toplevel_anchored / workerw / defview_adopt）",
+                _ => "未知策略名（progman_child / progman_child_top / toplevel_bottom / toplevel_anchored / workerw / defview_adopt / defview_child）",
             })),
         }
     }

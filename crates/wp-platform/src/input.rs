@@ -9,7 +9,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_ESCAPE,
+    MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_D, VK_ESCAPE, VK_LWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetSystemMetrics, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
@@ -47,6 +47,17 @@ pub fn right_click(x: i32, y: i32) -> Result<()> {
         return Err(PlatformError::Unsupported("SendInput 未全部送达"));
     }
     Ok(())
+}
+
+/// 按一次 Win+D（显示桌面），用于验证「桌面被切换后 3 秒内自恢复」。
+pub fn press_win_d() {
+    let down_win = key_event(VK_LWIN, KEYBD_EVENT_FLAGS(0));
+    let down_d = key_event(VK_D, KEYBD_EVENT_FLAGS(0));
+    let up_d = key_event(VK_D, KEYEVENTF_KEYUP);
+    let up_win = key_event(VK_LWIN, KEYEVENTF_KEYUP);
+    unsafe {
+        let _ = SendInput(&[down_win, down_d, up_d, up_win], size_of::<INPUT>() as i32);
+    }
 }
 
 /// 按一次 Esc，用于关掉测试弹出来的菜单。

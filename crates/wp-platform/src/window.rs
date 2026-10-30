@@ -19,9 +19,10 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
-    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible,
+    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible,
     PeekMessageW, RegisterClassExW, ShowWindow, TranslateMessage, WindowFromPoint, GWL_EXSTYLE,
-    GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE, SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+    GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE, SW_MINIMIZE, SW_RESTORE,
     WINDOW_EX_STYLE,
     WINDOW_STYLE, WNDCLASSEXW, WNDCLASS_STYLES, WM_ERASEBKGND, WM_NCHITTEST,
 };
@@ -52,6 +53,8 @@ pub struct HostWindowSpec {
     pub rect: PhysicalRect,
     pub ex_style: u32,
     pub style: u32,
+    /// 父窗口。`None` = 顶层窗口；`Some` = 作为该窗口的子窗口创建。
+    pub parent: Option<isize>,
 }
 
 impl HostWindowSpec {
@@ -60,6 +63,21 @@ impl HostWindowSpec {
             rect,
             ex_style: HOST_EX_STYLE,
             style: HOST_STYLE,
+            parent: None,
+        }
+    }
+
+    /// 以 `parent` 的子窗口身份创建。
+    ///
+    /// 策略 F 用：宿主挂到 `SHELLDLL_DefView` 下面，进程死掉只会带走自己，
+    /// 不会波及 Explorer 的图标层。
+    pub fn child_of(parent: isize, rect: PhysicalRect) -> Self {
+        Self {
+            rect,
+            ex_style: HOST_EX_STYLE,
+            // WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS
+            style: 0x4000_0000 | 0x1000_0000 | 0x0400_0000,
+            parent: Some(parent),
         }
     }
 
@@ -102,7 +120,7 @@ pub fn create_host_window(spec: &HostWindowSpec) -> Result<isize> {
             spec.rect.y,
             spec.rect.width as i32,
             spec.rect.height as i32,
-            None,
+            spec.parent.map(raw),
             None,
             Some(instance),
             None,
@@ -123,6 +141,19 @@ pub fn destroy_host_window(hwnd: isize) {
 /// 句柄是否仍然有效。
 pub fn is_host_window_alive(hwnd: isize) -> bool {
     unsafe { IsWindow(Some(raw(hwnd))).as_bool() }
+}
+
+/// 窗口是否处于最小化状态。
+///
+/// `Win+D`（显示桌面）会把顶层窗口最小化，子窗口跟着一起下去——
+/// 策略 E 的宿主是顶层窗口，所以必须能检测到这种情况。
+pub fn is_minimized(hwnd: isize) -> bool {
+    unsafe { IsIconic(raw(hwnd)).as_bool() }
+}
+
+/// 从最小化状态恢复并保持 `WS_VISIBLE`。
+pub fn restore_window(hwnd: isize) -> bool {
+    unsafe { ShowWindow(raw(hwnd), SW_RESTORE).as_bool() }
 }
 
 /// 把 `isize` 还原成 `HWND`。仅在本 crate 内部使用。
@@ -171,67 +202,179 @@ pub fn pump_messages() -> u32 {
     handled
 }
 
-thread_local! {
-    static MINIMIZED: std::cell::RefCell<Vec<isize>> = const { std::cell::RefCell::new(Vec::new()) };
+/// 被本进程收起过的一个窗口。
+#[derive(Clone)]
+struct MinimizedWindow {
+    hwnd: isize,
+    pid: u32,
+    class: String,
 }
 
-/// 最小化所有可见的普通顶层窗口，返回被最小化的句柄。
+thread_local! {
+    /// 本进程当前收起的所有窗口。累加而不是覆盖：一次截图测试里会多次最小化。
+    static MINIMIZED: std::cell::RefCell<Vec<MinimizedWindow>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 最小化所有可见的普通顶层窗口，返回**本次新收起**的句柄。
 ///
 /// 只为 M0 的截图验证服务：先把桌面亮出来，再挂壁纸。
-/// 桌面壳层（Progman / 任务栏 / WorkerW）和工具窗口会被跳过。
+/// 桌面壳层（Progman / 任务栏 / WorkerW）、工具窗口、已经最小化的窗口会被跳过。
+///
+/// 一律用「最小化」而不是 `ShowWindow(SW_HIDE)`：隐藏的窗口不会出现在任务栏和
+/// `Alt+Tab` 里，一旦进程被杀（supervisor 重启、崩溃）就再也没人把它们恢复——
+/// 用户的软件会「消失」，实测踩过。最小化即使没恢复也只是收进任务栏，用户点一下就好。
+/// 另外每次改动都会写一份日志，进程异常死亡后由 [`restore_leaked_windows`] 兜底。
 pub fn minimize_other_windows() -> Vec<isize> {
-    MINIMIZED.with(|v| v.borrow_mut().clear());
+    let before = MINIMIZED.with(|v| v.borrow().len());
     unsafe {
         let _ = EnumWindows(Some(minimize_cb), LPARAM(0));
     }
-    MINIMIZED.with(|v| v.borrow().clone())
+    MINIMIZED.with(|v| {
+        let list = v.borrow();
+        write_journal(&list);
+        list[before..].iter().map(|w| w.hwnd).collect()
+    })
 }
 
 /// 恢复 [`minimize_other_windows`] 最小化的窗口。
 pub fn restore_windows(handles: &[isize]) {
-    unsafe {
-        for &h in handles {
+    for &h in handles {
+        unsafe {
             let _ = ShowWindow(raw(h), SW_RESTORE);
         }
     }
+    MINIMIZED.with(|v| {
+        v.borrow_mut().retain(|w| !handles.contains(&w.hwnd));
+        write_journal(&v.borrow());
+    });
 }
 
-thread_local! {
-    static HIDDEN: std::cell::RefCell<Vec<isize>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// 直接把其它窗口藏起来（比最小化更彻底：不受最小化动画和应用自恢复影响）。
-///
-/// 截图与输入验证都需要「桌面真的在最前面」，最小化对某些应用不可靠。
-pub fn hide_other_windows() -> Vec<isize> {
-    HIDDEN.with(|v| v.borrow_mut().clear());
-    unsafe {
-        let _ = EnumWindows(Some(hide_cb), LPARAM(0));
+unsafe extern "system" fn minimize_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    if should_skip(hwnd) {
+        return BOOL(1);
     }
-    HIDDEN.with(|v| v.borrow().clone())
+    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    MINIMIZED.with(|v| {
+        let handle = hwnd.0 as isize;
+        let mut list = v.borrow_mut();
+        if !list.iter().any(|w| w.hwnd == handle) {
+            list.push(MinimizedWindow {
+                hwnd: handle,
+                pid,
+                class: class_name(hwnd),
+            });
+        }
+    });
+    BOOL(1)
 }
 
-/// 恢复 [`hide_other_windows`] 藏起来的窗口。
-pub fn show_windows(handles: &[isize]) {
+/// 当前进程的日志文件。按 PID 分开，避免多个实例互相覆盖。
+fn journal_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("wallpaper-minimized-{}.txt", std::process::id()))
+}
+
+fn write_journal(list: &[MinimizedWindow]) {
+    let path = journal_path();
+    if list.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let body: String = list
+        .iter()
+        .map(|w| format!("{}|{}|{}\n", w.hwnd, w.pid, w.class))
+        .collect();
+    let _ = std::fs::write(&path, body);
+}
+
+/// 上一次进程被强杀时来不及恢复的窗口，这里按日志还回去。
+///
+/// 只认「日志里的句柄 + 进程 + 类名」三者都还对得上的窗口，宁可少恢复也不误伤；
+/// 日志主人还活着（另一个实例正在跑）就跳过。
+pub fn restore_leaked_windows() -> Option<String> {
+    let dir = std::env::temp_dir();
+    let me = std::process::id();
+    let mut restored = 0usize;
+    let mut files = 0usize;
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(owner) = name
+            .strip_prefix("wallpaper-minimized-")
+            .and_then(|s| s.strip_suffix(".txt"))
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if owner == me || process_alive(owner) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        files += 1;
+        for line in text.lines() {
+            let mut parts = line.split('|');
+            let (Some(h), Some(pid), Some(class)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            let (Ok(hwnd), Ok(pid)) = (h.parse::<isize>(), pid.parse::<u32>()) else {
+                continue;
+            };
+            if !unsafe { IsWindow(Some(raw(hwnd))) }.as_bool() {
+                continue;
+            }
+            if window_pid(hwnd) != pid || class_name(raw(hwnd)) != class {
+                continue;
+            }
+            if is_minimized(hwnd) && restore_window(hwnd) {
+                restored += 1;
+            }
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+    (files > 0).then(|| format!("上次异常退出留下 {files} 份窗口日志，已恢复 {restored} 个窗口"))
+}
+
+fn window_pid(hwnd: isize) -> u32 {
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(raw(hwnd), Some(&mut pid)) };
+    pid
+}
+
+/// 进程是否还活着。
+///
+/// 只看 `OpenProcess` 成功是不够的：只要还有别的进程持有它的句柄，
+/// 已退出的进程对象仍然可以被打开（PID 也不会被回收），会被误判成活着。
+/// 必须再用 `WaitForSingleObject(handle, 0)` 判断是否已经终止。
+pub(crate) fn process_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     unsafe {
-        for &h in handles {
-            let _ = ShowWindow(raw(h), SW_SHOW);
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let wait = WaitForSingleObject(handle, 0);
+                let _ = CloseHandle(handle);
+                wait == WAIT_TIMEOUT
+            }
+            // 打不开基本等于不存在。
+            Err(_) => false,
         }
     }
 }
 
-unsafe extern "system" fn hide_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-    if should_skip(hwnd) {
-        return BOOL(1);
-    }
-    let _ = ShowWindow(hwnd, SW_HIDE);
-    HIDDEN.with(|v| v.borrow_mut().push(hwnd.0 as isize));
-    BOOL(1)
-}
-
-/// 桌面壳层、工具窗口和宿主自己都不能动。
+/// 桌面壳层、工具窗口、已经最小化的窗口和宿主自己都不能动。
 fn should_skip(hwnd: HWND) -> bool {
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return true;
+    }
+    // 已经最小化的就别碰：否则恢复时会把用户自己收起来的窗口全弹出来。
+    if unsafe { IsIconic(hwnd) }.as_bool() {
         return true;
     }
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
@@ -242,15 +385,6 @@ fn should_skip(hwnd: HWND) -> bool {
         class_name(hwnd).as_str(),
         "Progman" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "WorkerW" | WINDOW_CLASS
     )
-}
-
-unsafe extern "system" fn minimize_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-    if should_skip(hwnd) {
-        return BOOL(1);
-    }
-    let _ = ShowWindow(hwnd, SW_MINIMIZE);
-    MINIMIZED.with(|v| v.borrow_mut().push(hwnd.0 as isize));
-    BOOL(1)
 }
 
 fn class_name(hwnd: HWND) -> String {

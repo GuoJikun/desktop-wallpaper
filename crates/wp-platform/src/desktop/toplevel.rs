@@ -134,6 +134,36 @@ pub(crate) fn is_at_bottom_of_band(a: HWND, anchor: HWND) -> bool {
     }
 }
 
+/// 顶层 z 链快照（0 最靠上），用于诊断「z 序刚被谁改了」。
+///
+/// 每项是 `(句柄, 类名, 是否可见, 是否最小化)`。窗口数超过 4096 视为链异常。
+pub fn z_chain() -> Vec<(isize, String, bool, bool)> {
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(mut cur) = GetTopWindow(None) else {
+            return out;
+        };
+        loop {
+            let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(cur).as_bool();
+            let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(cur).as_bool();
+            out.push((
+                cur.0 as isize,
+                crate::input::class_of(cur.0 as isize),
+                visible,
+                minimized,
+            ));
+            if out.len() > 4096 {
+                break;
+            }
+            match GetWindow(cur, GW_HWNDNEXT) {
+                Ok(next) => cur = next,
+                Err(_) => break,
+            }
+        }
+    }
+    out
+}
+
 /// 在顶层窗口 z 链中的位置：0 最靠上，依次往下。
 pub(crate) fn z_index(target: HWND) -> Option<u32> {
     unsafe {

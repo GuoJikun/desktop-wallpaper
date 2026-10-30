@@ -58,6 +58,9 @@ enum Cmd {
         /// 诊断：截图后把图标层缩到左上角 400×300 再截一张
         #[arg(long)]
         shrink_shot: bool,
+        /// 截图后按 Win+D，等 3 秒再截一张，验证桌面切换后壁纸是否还在
+        #[arg(long)]
+        win_d_shot: bool,
     },
     /// 截取整屏到 BMP，不做其它事
     Shot {
@@ -97,6 +100,10 @@ fn main() -> Result<()> {
     if let Some(healed) = wp_platform::heal_desktop() {
         eprintln!("[桌面自愈] {healed}");
     }
+    // 上一次被强杀时收起的窗口也还回去（只认日志里对得上的句柄）。
+    if let Some(restored) = wp_platform::restore_leaked_windows() {
+        eprintln!("[窗口自愈] {restored}");
+    }
 
     match Cli::parse().command {
         Cmd::Probe {
@@ -112,6 +119,7 @@ fn main() -> Result<()> {
             verbose,
             detach_shot,
             shrink_shot,
+            win_d_shot,
         } => probe(
             json,
             report,
@@ -125,6 +133,7 @@ fn main() -> Result<()> {
                 verbose,
                 detach_shot,
                 shrink_shot,
+                win_d_shot,
             },
             monitor,
         ),
@@ -167,6 +176,7 @@ struct RunOpts<'a> {
     verbose: bool,
     detach_shot: bool,
     shrink_shot: bool,
+    win_d_shot: bool,
 }
 
 fn probe(
@@ -330,6 +340,17 @@ fn print_matrix(matrix: &[Value]) {
                 shot["center_class"].as_str().unwrap_or("-"),
             );
         }
+        if run["win_d_shot"].is_object() {
+            let shot = &run["win_d_shot"];
+            println!(
+                "  {:<18} Win+D 后截图: {} 测试色占比={:.1}% 图标区异色像素={} 屏幕中心命中={}",
+                "",
+                shot["path"].as_str().unwrap_or("-"),
+                shot["wallpaper_ratio"].as_f64().unwrap_or(0.0) * 100.0,
+                shot["icons_non_matching"].as_u64().unwrap_or(0),
+                shot["center_class"].as_str().unwrap_or("-"),
+            );
+        }
     }
 }
 
@@ -374,17 +395,24 @@ fn run_one(
         }
     };
 
-    // 先把桌面露出来，避免截图被别的窗口糊住。
-    let minimized = if opts.minimize {
+    // 先把桌面露出来，避免截图被别的窗口糊住。只最小化，绝不隐藏（见 restore 相关说明）。
+    let minimize_guard = RestoreGuard::new(if opts.minimize {
         let handles = wp_platform::minimize_other_windows();
         std::thread::sleep(Duration::from_millis(400));
         handles
     } else {
         Vec::new()
-    };
+    });
 
-    let spec = wp_platform::HostWindowSpec::for_monitor(monitor.rect)
-        .with_noredirection_bitmap(content == "d3d");
+    let spec = match strategy {
+        Strategy::DefViewChild => {
+            let parent = wp_platform::defview_handle()
+                .context("找不到图标层，策略 F 无法创建子窗口")?;
+            wp_platform::HostWindowSpec::child_of(parent, monitor.rect)
+        }
+        _ => wp_platform::HostWindowSpec::for_monitor(monitor.rect),
+    }
+    .with_noredirection_bitmap(content == "d3d");
     let hwnd = wp_platform::create_host_window(&spec)
         .with_context(|| format!("创建宿主窗口失败（{name}）"))?;
 
@@ -400,7 +428,7 @@ fn run_one(
 
     // D3D 内容必须在 attach 之后创建：策略 A 会重新 SetParent，
     // 提前建的 DComp target 会挂在旧父窗口上。
-    let topmost = strategy != Strategy::DefViewAdopt;
+    let topmost = !matches!(strategy, Strategy::DefViewAdopt | Strategy::DefViewChild);
     let mut surface = if content == "d3d" && attached {
         // 策略 E 里 DefView 是我们的子窗口，visual 必须在子窗口之下。
         make_surface(name, hwnd, monitor.rect, topmost)
@@ -416,6 +444,7 @@ fn run_one(
     let mut input_result: Option<Value> = None;
     let mut detach_shot_result: Option<Value> = None;
     let mut shrink_shot_result: Option<Value> = None;
+    let mut win_d_shot_result: Option<Value> = None;
     let mut checks = 0u64;
     let mut corrected = 0u64;
     let mut lost = 0u64;
@@ -526,6 +555,41 @@ fn run_one(
             }
         }
 
+        // 诊断：按 Win+D 显示桌面，验证「桌面切换后 3 秒内壁纸仍在、看门狗无需重启」。
+        // 等待期间保持消息泵和看门狗运行，否则测的是「没人管」的状态。
+        if opts.win_d_shot && shot_result.is_some() && win_d_shot_result.is_none() {
+            let explorer_before = wp_platform::desktop_pid();
+            wp_platform::press_win_d();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                wp_platform::pump_messages();
+                if attached {
+                    let _ = host.ensure_band(hwnd);
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            let path = PathBuf::from(format!("{}.win_d.bmp", opts.shot.unwrap().display()));
+            if opts.verbose {
+                eprintln!(
+                    "[{name}] Win+D 后：minimized={} host={} explorer={:?}→{:?}\n           {}\n           {}",
+                    wp_platform::is_minimized(hwnd),
+                    wp_platform::describe(hwnd),
+                    explorer_before,
+                    wp_platform::desktop_pid(),
+                    wp_platform::defview_state(),
+                    z_band_report(hwnd)
+                );
+            }
+            win_d_shot_result = Some(take_shot(name, &path, monitor.rect, opts.minimize)?);
+            if opts.verbose {
+                eprintln!("[{name}] Win+D 截图后 z 链：{}", z_band_report(hwnd));
+            }
+            // 再按一次恢复窗口，避免后续检查和收尾跑在「显示桌面」状态里。
+            wp_platform::press_win_d();
+            std::thread::sleep(Duration::from_millis(500));
+            next_check = Instant::now();
+        }
+
         std::thread::sleep(Duration::from_millis(16));
     }
 
@@ -539,9 +603,7 @@ fn run_one(
         }
     }
     wp_platform::destroy_host_window(hwnd);
-    if !minimized.is_empty() {
-        wp_platform::restore_windows(&minimized);
-    }
+    minimize_guard.release();
 
     eprintln!(
         "[{name}] 结束：检查 {checks} 次，修正 {corrected} 次，丢失 {lost} 次，终态 {}",
@@ -563,6 +625,7 @@ fn run_one(
         "shot": shot_result,
         "detach_shot": detach_shot_result,
         "shrink_shot": shrink_shot_result,
+        "win_d_shot": win_d_shot_result,
         "input": input_result,
     }))
 }
@@ -573,14 +636,15 @@ fn take_shot(
     rect: PhysicalRect,
     minimize: bool,
 ) -> Result<Value> {
-    // 截图前再压一次：有些前台窗口会自己弹回来，只在开头最小化一次不够。
-    let extra = if minimize {
-        let handles = wp_platform::hide_other_windows();
+    // 截图前再收一次：有些前台窗口会自己弹回来，只在开头最小化一次不够。
+    // 注意只能用最小化——SW_HIDE 的窗口会从任务栏和 Alt+Tab 里消失，进程一死就没法恢复。
+    let extra = RestoreGuard::new(if minimize {
+        let handles = wp_platform::minimize_other_windows();
         std::thread::sleep(Duration::from_millis(500));
         handles
     } else {
         Vec::new()
-    };
+    });
     // 壁纸窗口刚画完一帧，稍等一下再截，避免抓到没刷新完的合成结果。
     std::thread::sleep(Duration::from_millis(300));
 
@@ -611,9 +675,7 @@ fn take_shot(
     );
 
     // 统计和命中测试都要在截图状态下做，之后才恢复其它窗口。
-    if !extra.is_empty() {
-        wp_platform::show_windows(&extra);
-    }
+    extra.release();
 
     Ok(json!({
         "path": path.display().to_string(),
@@ -622,6 +684,57 @@ fn take_shot(
         "point_60_class": point,
         "center_class": center,
     }))
+}
+
+/// 打印宿主窗口与 `Progman` 之间的 z 链片段，用来定位「谁插在了中间」。
+fn z_band_report(host: isize) -> String {
+    let chain = wp_platform::z_chain();
+    let Some(hz) = chain.iter().position(|e| e.0 == host) else {
+        return "宿主不在顶层 z 链里（可能被最小化或已隐藏）".into();
+    };
+    let pz = wp_platform::progman_z().map(|z| z as usize).unwrap_or(hz + 2);
+    let from = hz.saturating_sub(1);
+    let to = (pz + 2).min(chain.len().saturating_sub(1));
+    if to < from {
+        return format!("z 链异常：宿主 #{hz}，Progman #{pz}");
+    }
+    chain[from..=to]
+        .iter()
+        .enumerate()
+        .map(|(i, (h, class, visible, minimized))| {
+            format!(
+                "#{}{} {class} visible={visible} min={minimized}",
+                from + i,
+                if *h == host { " <宿主>" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// 保证「收起的窗口一定被恢复」：即使中途 `?` 提前返回，`Drop` 也会执行。
+///
+/// 这条守卫是必须的：进程崩溃后没人恢复窗口虽然只是被收进任务栏，
+/// 但测试工具在失败路径上留下副作用会污染下一次测量。
+struct RestoreGuard(Vec<isize>);
+
+impl RestoreGuard {
+    fn new(handles: Vec<isize>) -> Self {
+        Self(handles)
+    }
+
+    fn release(mut self) {
+        wp_platform::restore_windows(&self.0);
+        self.0.clear();
+    }
+}
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            wp_platform::restore_windows(&self.0);
+        }
+    }
 }
 
 fn band_name(state: BandState) -> &'static str {
@@ -654,12 +767,13 @@ fn test_input(rect: PhysicalRect, minimize: bool) -> Value {
     let y = rect.y + rect.height as i32 / 2;
 
     // 右键必须打到桌面上。有些应用被最小化后会立刻弹回来，
-    // 所以直接隐藏，直到命中桌面窗口为止（最多 5 次）。
-    let mut hidden = Vec::new();
+    // 所以每次点击前再收一次（最多 5 次）。只最小化，绝不隐藏：
+    // 隐藏的窗口会从任务栏 / Alt+Tab 里消失，本进程一死就再也回不来。
+    let mut minimized = Vec::new();
     let mut hit = String::new();
     for _ in 0..5 {
         if minimize {
-            hidden = wp_platform::hide_other_windows();
+            minimized = wp_platform::minimize_other_windows();
             std::thread::sleep(Duration::from_millis(200));
         }
         hit = wp_platform::class_at_point(x, y);
@@ -680,16 +794,16 @@ fn test_input(rect: PhysicalRect, minimize: bool) -> Value {
     wp_platform::press_escape();
     std::thread::sleep(Duration::from_millis(300));
 
-    if !hidden.is_empty() {
-        wp_platform::show_windows(&hidden);
+    if !minimized.is_empty() {
+        wp_platform::restore_windows(&minimized);
     }
 
-    let hidden_classes: Vec<String> = hidden
+    let minimized_classes: Vec<String> = minimized
         .iter()
         .map(|h| wp_platform::input::class_of(*h))
         .collect();
     eprintln!(
-        "[input] 在 ({x},{y}) 右键：命中={hit} 隐藏窗口={hidden_classes:?} 发送={clicked} 新窗口={new_windows:?} explorer={explorer_pid:?} 菜单={menu}"
+        "[input] 在 ({x},{y}) 右键：命中={hit} 收起的窗口={minimized_classes:?} 发送={clicked} 新窗口={new_windows:?} explorer={explorer_pid:?} 菜单={menu}"
     );
 
     json!({
