@@ -227,24 +227,91 @@ SendMessageTimeout(Progman, 0x052C, wParam=0xD, lParam=0) -> ret=1
 | 2 | 接管状态下把 `DefView` 还给 `Progman` 后截图（`--detach-shot`） | 95.6% | 壁纸窗口本身渲染正常 |
 | 3 | 接管状态下把 `DefView` 缩到 400×300 后截图（`--shrink-shot`） | 89.8%，图标被挤到角落 | **新 `DefView` 不透明，把壁纸整个盖住** |
 | 4 | 进程内重建宿主窗口（detach 后重建 / 不 detach 直接重建） | 0.0% | 进程内无解 |
-| 5 | 杀掉 `wpctl` 进程再起一个，接管同一桌面 | **94.6%** | 只有进程重启才行 |
+| 5 | `wpctl` 正常退出后再起一个，接管同一桌面 | **94.6%** | 换进程才行，进程内重建窗口无效 |
+| 6 | 直接 `Stop-Process` 硬杀 `wpctl` 再起一个 | 桌面图标层被销毁 | 硬杀不可接受，见 §7.8 |
 
 第 3 步的截图最能说明问题：`topmost=false` 的 DComp visual 一直在合成，问题纯粹是子窗口不透明。
 
-唯一有效的恢复方式是让 Explorer 看到「图标层的父进程已经死了」，它才会重新初始化背景。
-所以策略 E 的契约定为：
+所以策略 E 的契约是：
 
 ```
 ensure_band() == Lost  ⇔  图标层句柄失效（Explorer 换了桌面壳层）
                        ⇒  上层必须重启 wp-host，进程内重建无效
+                       ⇒  重启必须优雅退出（先 detach），不许硬杀（见 §7.8）
 ```
 
 `wpctl` 收到 `Lost` 立即退出并打印原因；生产环境由 supervisor 重启该显示器的 `wp-host`。
 端到端验证（脚本模拟 supervisor）：
 
 ```
-第 1 轮：杀 Explorer → 检查 4 次 → Lost → 进程退出
+第 1 轮：杀 Explorer → 检查 4 次 → Lost → 进程优雅退出
 第 2 轮：新进程接管新桌面 → 测试色 94.6%、图标区异色像素 5603、终态 correct
 ```
+
+### 7.6 `Win+D`：显示桌面会把 `Progman` 抬到最上层
+
+脚本化验证时发现一个只在 `Win+D` 后出现的问题：壁纸整块消失（测试色 0%），
+桌面中心命中的是 `Progman`，而我们的 z 链检查报 `Lost`。
+
+抓到的 z 链（`Win+D` 之后一秒内）：
+
+```
+#42  Progman                ← 被显示桌面抬到了最上面
+...
+#393 <宿主> WallpaperHostWindow
+```
+
+| 处理方式 | 结果 | 结论 |
+|---|---|---|
+| 对宿主 `SetWindowPos(HWND_BOTTOM)` | 仍是 0% | `Progman` 在上面，往下压只会更藏在它后面 |
+| 对 `Progman` `SetWindowPos(HWND_BOTTOM)` | **94.3%–99.0%（3 轮）** | 正确：把抬起的那一方放回去 |
+
+顺带修正了 `Lost` 的判定口径：`Win+D`/开始菜单动画期间会有过渡窗口插在宿主与 `Progman` 之间，
+一次修正不成功是正常的。`adopt` 改成「连续 5 次修不回来（约 10 s）才报 `Lost`」，
+单次失败按 `Corrected` 下一个周期重试，避免误触发进程重启。
+
+### 7.7 策略 F（自己当 `DefView` 的子窗口）：证否
+
+动机很直接：如果 `DefView` 是父窗口，进程死掉只会带走我们自己的窗口，
+不会连累 Explorer 的图标层（§7.8 的坑就没了）。结构上确实能挂上：
+
+```
+窗口 parent=Some(DefView) style=0x54000000（WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS）
+命中测试：中心 = SysListView32（图标在上，符合预期）
+右键菜单：正常弹出
+```
+
+但画面始终是 0%：
+
+| 内容 | 测试色占比 | 图标区异色像素 |
+|---|---|---|
+| GDI 纯色 | 0.0% | 120000（整个图标区都不是测试色） |
+| D3D11 + DComp | 0.0% | 120000 |
+
+同一条流程在策略 E 下分别是 94.6% / 5603，说明不是渲染代码的问题。
+结论：**跨进程的普通子窗口拿不到自己的合成表面**，画进去的内容不进 DWM 合成。
+所以「自己挂到 `DefView` 下面」不能用来规避崩溃风险，策略 F 不再推进。
+
+### 7.8 硬杀渲染进程 = 连图标层一起销毁
+
+用 `Stop-Process` 杀 `wpctl`（模拟 supervisor 硬重启）之后：
+
+```
+全机窗口树里找不到 SHELLDLL_DefView，SysListView32 也没了
+→ 桌面图标消失、任务栏与 Alt+Tab 里看不到已打开的软件，按 Win+D 也救不回来
+```
+
+原因就是策略 E 的父子关系反过来：`DefView` 是我们的子窗口，父窗口被销毁时
+Windows 会连带销毁子窗口，而 Explorer 不会自动重建图标层（只能重启 Explorer）。
+
+对应措施（均已实现并实测）：
+
+1. **重启必须优雅退出**：`detach` 把 `DefView` 还给 `Progman` 后再退出，禁止硬杀。
+2. **崩溃兜底**：接管期间写 `%TEMP%\wallpaper-defview-adopted.txt`（含接管进程 PID），
+   下次启动 `heal_desktop()` 发现图标层全没了且记录是本进程留下的，就自动重启 Explorer 修复。
+   实测：硬杀 → `wpctl probe` → 打印「图标层已被销毁，已重启 Explorer 修复桌面」→ 图标层回来。
+3. **测试工具不许藏别人的窗口**：截图时一律最小化而不是 `SW_HIDE`。
+   隐藏的窗口会从任务栏和 `Alt+Tab` 里消失，进程一死就再也没人恢复（这也是上面「软件消失」的另一个来源）。
+   同时把收起过的窗口写进 `%TEMP%\wallpaper-minimized-<pid>.txt`，下次启动自动还原。
 
 

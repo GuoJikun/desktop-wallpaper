@@ -19,6 +19,13 @@
    **第四条：Explorer 重启后必须重启 `wp-host` 进程。** 新 `SHELLDLL_DefView` 不透明，
    进程内重建窗口实测仍是黑屏（0%），只有重启进程能恢复（94.6%）。
    所以 `ensure_band() == Lost` 的含义是「请 supervisor 重启本进程」，不要原地重试。
+   **第五条：重启必须是优雅退出。** 先 `detach` 把 `DefView` 还给 `Progman`，再退出进程。
+   禁止 `Stop-Process` / `TerminateProcess` 硬杀：`DefView` 是我们窗口的子窗口，
+   Windows 会连它一起销毁 → 桌面图标层消失、任务栏与 `Alt+Tab` 错乱（实测，只能重启 Explorer 恢复）。
+   万一真的崩溃，`heal_desktop()` 会读接管期间写的崩溃记录（`%TEMP%\wallpaper-defview-adopted.txt`），
+   发现图标层彻底没了就自动重启 Explorer 修复。
+   **第六条：`Win+D` 后不要压宿主，要压 `Progman`。** 显示桌面会把 `Progman` 抬到最上面，
+   此时对宿主 `HWND_BOTTOM` 只会让壁纸整块被盖住（实测 94.6% → 0%），正确做法是把 `Progman` 压回底部。
 4. **不要把内容画到 `Progman` 子窗口的 GDI 表面上。** 实测黑屏，且会被 DefView 盖住。
 5. **不要只调用一次 `SetWindowPos` 就认为层级正确。** z 带会漂移，必须有看门狗。
 6. **不要让壁纸窗口吃掉桌面输入。** 除 `WS_EX_TRANSPARENT` 外，必须实现 `WM_NCHITTEST → HTTRANSPARENT`。
@@ -62,9 +69,9 @@
 |---|---|
 | 多显示器 / 混合 DPI | 单屏环境，未验证 |
 | Explorer 重启 | **已实测**：进程内无解，须重启 `wp-host`（watchdog 报 `Lost`，端到端验证通过） |
-| `Win+D`、任务视图 | 人工试过无异常，待脚本化验证 |
+| `Win+D` | **已实测**：显示桌面会把 `Progman` 抬到宿主之上；改成把 `Progman` 压回底部后壁纸稳定（94.3%–99.0%，3 轮） |
 | 锁屏解锁、RDP 重连、休眠唤醒 | 未验证 |
-| 崩溃后桌面自愈 | `heal_desktop()` 已实现，未做故障注入测试 |
+| 崩溃后桌面自愈 | **已实测**：硬杀会连 `DefView` 一起销毁 → 下次启动按崩溃记录自动重启 Explorer 恢复 |
 | 全屏独占游戏暂停判定 | 未验证 |
 | 长时间（≥ 30 分钟）稳定性 / GPU 占用 | 只跑到 150 秒 |
 
