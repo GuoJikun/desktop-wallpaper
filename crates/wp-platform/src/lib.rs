@@ -7,22 +7,28 @@ pub mod dcomp;
 pub mod desktop;
 pub mod input;
 pub mod monitor;
+pub mod pause;
 pub mod window;
 
 pub use capture::{capture, save_bmp, ScreenImage};
 pub use dcomp::DcompSurface;
-pub use input::{desktop_pid, new_top_level, press_escape, press_win_d, right_click, snapshot_top_level};
 pub use desktop::{
     defview_handle, defview_state, heal_desktop, progman_z, resize_defview, z_chain, z_index_of,
     BandState, DefViewChild, DesktopHost, PlatformError, ProbeReport, Strategy, TopLevelBottom,
     WorkerWInfo,
 };
+pub use input::{
+    desktop_pid, new_top_level, press_escape, press_win_d, right_click, snapshot_top_level,
+};
 pub use monitor::{enumerate_monitors, MonitorInfo};
+pub use pause::{
+    decide, sample, ForegroundWindow, PauseFlags, PauseInputs, PauseReason, PauseReport,
+};
 pub use window::{
-    class_at_point, create_host_window, describe, destroy_host_window, is_host_window_alive,
-    is_minimized, minimize_other_windows, move_host_window, paint_solid, pump_messages,
-    restore_leaked_windows, restore_window, restore_windows, HostWindowSpec, TEST_COLOR, TEST_RGB,
-    WINDOW_CLASS,
+    activate_window, class_at_point, create_host_window, create_probe_window, describe,
+    destroy_host_window, is_host_window_alive, is_minimized, minimize_other_windows,
+    move_host_window, paint_solid, pump_messages, restore_leaked_windows, restore_window,
+    restore_windows, HostWindowSpec, PROBE_WINDOW_CLASS, TEST_COLOR, TEST_RGB, WINDOW_CLASS,
 };
 
 /// 桌面宿主窗口的推荐扩展样式。

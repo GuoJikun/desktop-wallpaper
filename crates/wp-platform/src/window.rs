@@ -5,7 +5,7 @@
 
 use std::mem::size_of;
 
-use windows::core::{PCWSTR, BOOL};
+use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
     RECT, WPARAM,
@@ -18,12 +18,13 @@ use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
-    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, PeekMessageW, RegisterClassExW, SetWindowPos, ShowWindow,
-    TranslateMessage, WindowFromPoint, GWL_EXSTYLE, GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE,
-    SET_WINDOW_POS_FLAGS, SW_MINIMIZE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WNDCLASS_STYLES, WM_ERASEBKGND, WM_NCHITTEST,
+    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    EnumWindows, GetClassNameW, GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW, RegisterClassExW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WindowFromPoint, GWL_EXSTYLE,
+    GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
+    WM_NCHITTEST, WNDCLASSEXW, WNDCLASS_STYLES, WNDPROC,
 };
 
 use wp_core::PhysicalRect;
@@ -43,6 +44,9 @@ pub const TEST_RGB: [u8; 3] = [0xD0, 0x30, 0x30];
 
 /// 窗口类名。必须是全局唯一的常量，改名等于换一类窗口。
 pub const WINDOW_CLASS: &str = "WallpaperHostWindow";
+
+/// 自测窗口类名：暂停判定的「最大化遮挡」验证用，故意和宿主窗口区分开。
+pub const PROBE_WINDOW_CLASS: &str = "WallpaperPauseProbe";
 
 /// `WS_EX_NOREDIRECTIONBITMAP`：不分配重定向表面，内容只能由 DComp 提供。
 pub const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
@@ -102,8 +106,8 @@ impl HostWindowSpec {
 pub fn create_host_window(spec: &HostWindowSpec) -> Result<isize> {
     unsafe {
         set_dpi_awareness();
-        let module = GetModuleHandleW(None)
-            .map_err(|e| win32("GetModuleHandleW", e.code().0 as u32))?;
+        let module =
+            GetModuleHandleW(None).map_err(|e| win32("GetModuleHandleW", e.code().0 as u32))?;
         let instance = HINSTANCE(module.0);
 
         register_class(instance)?;
@@ -134,6 +138,74 @@ pub fn create_host_window(spec: &HostWindowSpec) -> Result<isize> {
 pub fn destroy_host_window(hwnd: isize) {
     unsafe {
         let _ = DestroyWindow(raw(hwnd));
+    }
+}
+
+/// 创建一块铺满 `rect` 的普通前台窗口，仅用于验证暂停判定。
+///
+/// 与 [`create_host_window`] 的区别：没有任何透明 / 不激活样式，也不吃鼠标，
+/// 就是一个「看起来像全屏应用」的普通窗口。用完必须 [`destroy_host_window`]。
+pub fn create_probe_window(rect: PhysicalRect) -> Result<isize> {
+    unsafe {
+        set_dpi_awareness();
+        let module =
+            GetModuleHandleW(None).map_err(|e| win32("GetModuleHandleW", e.code().0 as u32))?;
+        let instance = HINSTANCE(module.0);
+
+        register_named(instance, PROBE_WINDOW_CLASS, Some(probe_wnd_proc))?;
+
+        let class = wide(PROBE_WINDOW_CLASS);
+        let title = wide("wallpaper pause probe");
+        let style = 0x8000_0000u32 | 0x1000_0000 | 0x0400_0000; // WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            WINDOW_STYLE(style),
+            rect.x,
+            rect.y,
+            rect.width as i32,
+            rect.height as i32,
+            None,
+            None,
+            Some(instance),
+            None,
+        )
+        .map_err(|e| win32("CreateWindowExW(probe)", e.code().0 as u32))?;
+
+        Ok(hwnd.0 as isize)
+    }
+}
+
+/// 把窗口抬到前台。返回是否真的成了前台窗口。
+///
+/// 系统有前台锁（foreground lock），后台进程直接调 `SetForegroundWindow`
+/// 通常只会闪烁任务栏。这里用标准的 `AttachThreadInput` 临时挂到当前前台线程，
+/// 再设置前台窗口——这是同一个交互会话内的合法做法，不要用模拟按键绕过。
+pub fn activate_window(hwnd: isize) -> bool {
+    use windows::Win32::System::Threading::AttachThreadInput;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    let h = raw(hwnd);
+    unsafe {
+        let fg = GetForegroundWindow();
+        let my_thread = windows::Win32::System::Threading::GetCurrentThreadId();
+        let fg_thread = if fg.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
+        let attached = fg_thread != 0
+            && fg_thread != my_thread
+            && AttachThreadInput(my_thread, fg_thread, true).as_bool();
+
+        let _ = BringWindowToTop(h);
+        let _ = SetForegroundWindow(h);
+
+        if attached {
+            let _ = AttachThreadInput(my_thread, fg_thread, false);
+        }
+        GetForegroundWindow() == h
     }
 }
 
@@ -337,7 +409,8 @@ pub fn restore_leaked_windows() -> Option<String> {
         files += 1;
         for line in text.lines() {
             let mut parts = line.split('|');
-            let (Some(h), Some(pid), Some(class)) = (parts.next(), parts.next(), parts.next()) else {
+            let (Some(h), Some(pid), Some(class)) = (parts.next(), parts.next(), parts.next())
+            else {
                 continue;
             };
             let (Ok(hwnd), Ok(pid)) = (h.parse::<isize>(), pid.parse::<u32>()) else {
@@ -473,12 +546,16 @@ fn set_dpi_awareness() {
 }
 
 fn register_class(instance: HINSTANCE) -> Result<()> {
+    register_named(instance, WINDOW_CLASS, Some(host_wnd_proc))
+}
+
+fn register_named(instance: HINSTANCE, name: &str, proc: WNDPROC) -> Result<()> {
     unsafe {
-        let class = wide(WINDOW_CLASS);
+        let class = wide(name);
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: WNDCLASS_STYLES(0),
-            lpfnWndProc: Some(host_wnd_proc),
+            lpfnWndProc: proc,
             hInstance: instance,
             lpszClassName: PCWSTR(class.as_ptr()),
             ..Default::default()
@@ -495,6 +572,17 @@ fn register_class(instance: HINSTANCE) -> Result<()> {
         }
         Err(win32("RegisterClassExW", err.0))
     }
+}
+
+/// 自测窗口的窗口过程：`DefWindowProcW` 是普通 `unsafe fn`，
+/// 不能直接当 `WNDPROC`（要求 `extern "system"`），包一层。
+unsafe extern "system" fn probe_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 unsafe extern "system" fn host_wnd_proc(

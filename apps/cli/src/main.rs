@@ -83,8 +83,27 @@ enum Cmd {
         #[arg(long)]
         source: PathBuf,
     },
-    /// 暂停所有渲染
-    Pause,
+    /// 查看暂停判定结果（全屏应用 / 最大化遮挡 / 电池 / 远程会话）
+    Pause {
+        /// 以 JSON 输出
+        #[arg(long)]
+        json: bool,
+        /// 显示器索引
+        #[arg(long, default_value_t = 0)]
+        monitor: usize,
+        /// 连续采样 N 秒（每秒一行），0 表示只采一次
+        #[arg(long, default_value_t = 0)]
+        watch: u64,
+        /// 自测：临时创建一个铺满屏幕的前台窗口，验证遮挡判定
+        #[arg(long)]
+        self_test: bool,
+        /// 自测窗口停留毫秒数（给 wp-host 的 1 s 采样留出观察窗口）
+        #[arg(long, default_value_t = 600)]
+        hold: u64,
+        /// 自测窗口尺寸 `宽x高`，默认铺满显示器；小于屏幕时可验证「不遮挡」分支
+        #[arg(long)]
+        size: Option<String>,
+    },
     /// 查看渲染进程状态
     Stats,
     /// 在桌面上模拟右键，验证桌面输入是否正常（基线对照用）
@@ -149,7 +168,9 @@ fn main() -> Result<()> {
             let monitors = wp_platform::enumerate_monitors();
             let rect = monitors
                 .get(monitor)
-                .with_context(|| format!("显示器索引 {monitor} 不存在（共 {} 台）", monitors.len()))?
+                .with_context(|| {
+                    format!("显示器索引 {monitor} 不存在（共 {} 台）", monitors.len())
+                })?
                 .rect;
             let result = test_input(rect, minimize);
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -157,9 +178,9 @@ fn main() -> Result<()> {
         }
         Cmd::Attach { monitor, source } => {
             let monitors = wp_platform::enumerate_monitors();
-            let info = monitors
-                .get(monitor)
-                .with_context(|| format!("显示器索引 {monitor} 不存在（共 {} 台）", monitors.len()))?;
+            let info = monitors.get(monitor).with_context(|| {
+                format!("显示器索引 {monitor} 不存在（共 {} 台）", monitors.len())
+            })?;
             bail!(
                 "attach 尚未实现（M0 第 3 步）。目标显示器: {} {}x{}，源: {}",
                 info.device,
@@ -168,7 +189,14 @@ fn main() -> Result<()> {
                 source.display()
             );
         }
-        Cmd::Pause => bail!("pause 尚未实现（M1）"),
+        Cmd::Pause {
+            json,
+            monitor,
+            watch,
+            self_test,
+            hold,
+            size,
+        } => pause_cmd(json, monitor, watch, self_test, hold, size.as_deref()),
         Cmd::Stats => bail!("stats 尚未实现（M1）"),
     }
 }
@@ -234,9 +262,12 @@ fn probe(
 
 fn shot_once(out: &Path, monitor_idx: usize, minimize: bool) -> Result<()> {
     let monitors = wp_platform::enumerate_monitors();
-    let monitor = monitors
-        .get(monitor_idx)
-        .with_context(|| format!("显示器索引 {monitor_idx} 不存在（共 {} 台）", monitors.len()))?;
+    let monitor = monitors.get(monitor_idx).with_context(|| {
+        format!(
+            "显示器索引 {monitor_idx} 不存在（共 {} 台）",
+            monitors.len()
+        )
+    })?;
 
     // 只最小化，不隐藏：隐藏的窗口会从任务栏 / Alt+Tab 消失，进程一死就回不来。
     let guard = RestoreGuard::new(if minimize {
@@ -248,8 +279,7 @@ fn shot_once(out: &Path, monitor_idx: usize, minimize: bool) -> Result<()> {
     });
 
     let image = wp_platform::capture(monitor.rect)?;
-    wp_platform::save_bmp(out, &image)
-        .with_context(|| format!("保存 {} 失败", out.display()))?;
+    wp_platform::save_bmp(out, &image).with_context(|| format!("保存 {} 失败", out.display()))?;
 
     let ratio = image.ratio_of(wp_platform::TEST_RGB);
     guard.release();
@@ -376,7 +406,12 @@ fn run_matrix(selection: &str, opts: &RunOpts<'_>, monitor_idx: usize) -> Result
     let monitors = wp_platform::enumerate_monitors();
     let monitor = monitors
         .get(monitor_idx)
-        .with_context(|| format!("显示器索引 {monitor_idx} 不存在（共 {} 台）", monitors.len()))?
+        .with_context(|| {
+            format!(
+                "显示器索引 {monitor_idx} 不存在（共 {} 台）",
+                monitors.len()
+            )
+        })?
         .clone();
 
     let strategies: Vec<Strategy> = if selection == "all" {
@@ -424,8 +459,8 @@ fn run_one(
 
     let spec = match strategy {
         Strategy::DefViewChild => {
-            let parent = wp_platform::defview_handle()
-                .context("找不到图标层，策略 F 无法创建子窗口")?;
+            let parent =
+                wp_platform::defview_handle().context("找不到图标层，策略 F 无法创建子窗口")?;
             wp_platform::HostWindowSpec::child_of(parent, monitor.rect)
         }
         _ => wp_platform::HostWindowSpec::for_monitor(monitor.rect),
@@ -441,7 +476,10 @@ fn run_one(
     if let Some(err) = &attach_error {
         eprintln!("[{name}] attach 失败: {err}");
     } else {
-        eprintln!("[{name}] attach 后窗口状态: {}", wp_platform::describe(hwnd));
+        eprintln!(
+            "[{name}] attach 后窗口状态: {}",
+            wp_platform::describe(hwnd)
+        );
     }
 
     // D3D 内容必须在 attach 之后创建：策略 A 会重新 SetParent，
@@ -457,7 +495,9 @@ fn run_one(
     let start = Instant::now();
     let mut next_check = start;
     let mut next_paint = start;
-    let mut shot_at = opts.shot.map(|_| start + Duration::from_secs(duration.max(2) / 2));
+    let mut shot_at = opts
+        .shot
+        .map(|_| start + Duration::from_secs(duration.max(2) / 2));
     let mut shot_result: Option<Value> = None;
     let mut input_result: Option<Value> = None;
     let mut detach_shot_result: Option<Value> = None;
@@ -493,9 +533,7 @@ fn run_one(
                     // （实测 0%；杀掉进程再起一次立刻恢复 94.6%）。
                     // 所以在进程内没有可行解法——请求上层重启 wp-host，这里是唯一正确的出口。
                     if state == BandState::Lost {
-                        eprintln!(
-                            "[{name}] 桌面壳层已更换，本进程无法自愈，需要重启渲染进程"
-                        );
+                        eprintln!("[{name}] 桌面壳层已更换，本进程无法自愈，需要重启渲染进程");
                         needs_restart = true;
                         break;
                     }
@@ -648,12 +686,7 @@ fn run_one(
     }))
 }
 
-fn take_shot(
-    name: &str,
-    path: &Path,
-    rect: PhysicalRect,
-    minimize: bool,
-) -> Result<Value> {
+fn take_shot(name: &str, path: &Path, rect: PhysicalRect, minimize: bool) -> Result<Value> {
     // 截图前再收一次：有些前台窗口会自己弹回来，只在开头最小化一次不够。
     // 注意只能用最小化——SW_HIDE 的窗口会从任务栏和 Alt+Tab 里消失，进程一死就没法恢复。
     let extra = RestoreGuard::new(if minimize {
@@ -667,16 +700,10 @@ fn take_shot(
     std::thread::sleep(Duration::from_millis(300));
 
     let image = wp_platform::capture(rect)?;
-    wp_platform::save_bmp(path, &image)
-        .with_context(|| format!("保存 {} 失败", path.display()))?;
+    wp_platform::save_bmp(path, &image).with_context(|| format!("保存 {} 失败", path.display()))?;
 
     let ratio = image.ratio_of(wp_platform::TEST_RGB);
-    let icon_rect = PhysicalRect::new(
-        rect.x,
-        rect.y,
-        400.min(rect.width),
-        300.min(rect.height),
-    );
+    let icon_rect = PhysicalRect::new(rect.x, rect.y, 400.min(rect.width), 300.min(rect.height));
     let icons_non_matching = image.non_matching(icon_rect, wp_platform::TEST_RGB);
 
     let point = wp_platform::class_at_point(rect.x + 60, rect.y + 60);
@@ -710,7 +737,9 @@ fn z_band_report(host: isize) -> String {
     let Some(hz) = chain.iter().position(|e| e.0 == host) else {
         return "宿主不在顶层 z 链里（可能被最小化或已隐藏）".into();
     };
-    let pz = wp_platform::progman_z().map(|z| z as usize).unwrap_or(hz + 2);
+    let pz = wp_platform::progman_z()
+        .map(|z| z as usize)
+        .unwrap_or(hz + 2);
     let from = hz.saturating_sub(1);
     let to = (pz + 2).min(chain.len().saturating_sub(1));
     if to < from {
@@ -841,4 +870,193 @@ fn is_desktop_class(class: &str) -> bool {
         class,
         "SysListView32" | "SHELLDLL_DefView" | "Progman" | "WorkerW" | "(none)"
     )
+}
+
+/// `wpctl pause`：采样暂停判定，可连续观察或自测遮挡规则。
+fn pause_cmd(
+    as_json: bool,
+    monitor_idx: usize,
+    watch: u64,
+    self_test: bool,
+    hold_ms: u64,
+    size: Option<&str>,
+) -> Result<()> {
+    let monitors = wp_platform::enumerate_monitors();
+    let info = monitors.get(monitor_idx).with_context(|| {
+        format!(
+            "显示器索引 {monitor_idx} 不存在（共 {} 台）",
+            monitors.len()
+        )
+    })?;
+    let rect = info.rect;
+
+    if self_test {
+        let probe_rect = match size {
+            Some(spec) => parse_size(spec)?,
+            None => rect,
+        };
+        return pause_self_test(rect, probe_rect, hold_ms, as_json);
+    }
+
+    if watch == 0 {
+        let report = wp_platform::pause::probe(None, rect, wp_platform::PauseFlags::default());
+        print_pause_report(&report, as_json)?;
+        return Ok(());
+    }
+
+    // 逐秒采样：用户可以在另一块屏上切进切出全屏游戏，观察判定是否跟着变。
+    for second in 0..watch {
+        let report = wp_platform::pause::probe(None, rect, wp_platform::PauseFlags::default());
+        if as_json {
+            println!("{}", serde_json::to_string(&report)?);
+        } else {
+            println!(
+                "[{second:>2}s] {:<10} {}",
+                if report.paused { "paused" } else { "running" },
+                report.summary()
+            );
+        }
+        if second + 1 < watch {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    Ok(())
+}
+
+fn print_pause_report(report: &wp_platform::PauseReport, as_json: bool) -> Result<()> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "状态: {}\n原因: {}\n通知状态: {} ({})\n前台: {}\n远程会话: {} 电池: {}",
+        if report.paused { "暂停" } else { "运行中" },
+        report.summary(),
+        report.notification_state,
+        report.notification_state_name,
+        match &report.foreground {
+            Some(fg) => format!(
+                "{} pid={} rect=({},{} {}x{}) 最大化={} 盖住本屏={}",
+                fg.class,
+                fg.pid,
+                fg.rect.x,
+                fg.rect.y,
+                fg.rect.width,
+                fg.rect.height,
+                fg.maximized,
+                fg.covers_monitor
+            ),
+            None => "(无)".into(),
+        },
+        report.remote_session,
+        match report.battery_percent {
+            Some(p) => format!(
+                "{p}%{}",
+                if report.on_battery {
+                    "（电池供电）"
+                } else {
+                    "（外接电源）"
+                }
+            ),
+            None => "未知".into(),
+        },
+    );
+    Ok(())
+}
+
+/// 自测：造一个铺满屏幕的前台窗口，看判定会不会报「被遮挡」，销毁后能不能恢复。
+///
+/// 这条路径验证的是「前台窗口矩形 ⊇ 显示器矩形」规则本身。`SHQueryUserNotificationState`
+/// 的全屏独占状态只有真正的全屏 D3D 应用才会给出，无法用普通窗口伪造。
+fn pause_self_test(
+    monitor: PhysicalRect,
+    probe_rect: PhysicalRect,
+    hold_ms: u64,
+    as_json: bool,
+) -> Result<()> {
+    let before = wp_platform::pause::probe(None, monitor, wp_platform::PauseFlags::default());
+
+    let hwnd = wp_platform::create_probe_window(probe_rect).context("创建自测窗口失败")?;
+    let guard = WindowGuard(hwnd);
+
+    let activated = wp_platform::activate_window(hwnd);
+    std::thread::sleep(Duration::from_millis(hold_ms.max(100)));
+    let covered = wp_platform::pause::probe(None, monitor, wp_platform::PauseFlags::default());
+
+    drop(guard);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = wp_platform::pause::probe(None, monitor, wp_platform::PauseFlags::default());
+
+    let expected_cover = probe_rect.width >= monitor.width && probe_rect.height >= monitor.height;
+    let detected = covered.reasons.iter().any(|r| {
+        matches!(
+            r,
+            wp_platform::PauseReason::MaximizedCover | wp_platform::PauseReason::FullscreenApp
+        )
+    });
+    // 恢复的判据是「回到测试前的状态」，而不是「一定没暂停」：
+    // 用户可能本来就有最大化窗口或低电量。
+    let restored = after.reasons == before.reasons;
+    // 小窗口自测是用来观察 wp-host 恢复渲染的，不做通过/失败断言。
+    let passed = if expected_cover {
+        Some(activated && detected && restored)
+    } else {
+        None
+    };
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "passed": passed,
+                "activated": activated,
+                "detected": detected,
+                "restored": restored,
+                "before": before,
+                "covered": covered,
+                "after": after,
+            }))?
+        );
+    } else {
+        println!("自测窗口已激活: {activated}");
+        println!("遮挡判定: {}（{}）", detected, covered.summary());
+        println!("销毁后恢复: {restored}（{}）", after.summary());
+        match passed {
+            Some(true) => println!("结论: 通过"),
+            Some(false) => println!("结论: 未通过"),
+            // 小窗口本来就不该触发遮挡，这是给 wp-host 观察恢复用的。
+            None => println!("结论: 小窗口模式，不做判定（预期不遮挡）"),
+        }
+        if !activated {
+            println!(
+                "提示: 系统前台锁拒绝了 SetForegroundWindow，请先手动点一下当前控制台再重试。"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 解析 `宽x高`，只接受 ASCII 的 `x` 或 `*`。
+fn parse_size(spec: &str) -> Result<PhysicalRect> {
+    let normalized = spec.replace('*', "x");
+    let (w, h) = normalized
+        .split_once('x')
+        .with_context(|| format!("尺寸格式应为 宽x高，例如 320x200（收到 {spec}）"))?;
+    let width: u32 = w.trim().parse().context("宽度不是整数")?;
+    let height: u32 = h.trim().parse().context("高度不是整数")?;
+    if width == 0 || height == 0 {
+        bail!("尺寸必须大于 0（收到 {spec}）");
+    }
+    Ok(PhysicalRect::new(0, 0, width, height))
+}
+
+/// 自测窗口的兜底销毁。
+struct WindowGuard(isize);
+
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            wp_platform::destroy_host_window(self.0);
+        }
+    }
 }

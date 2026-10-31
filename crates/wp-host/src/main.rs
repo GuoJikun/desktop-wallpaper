@@ -31,14 +31,14 @@ use windows::Win32::System::RemoteDesktop::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PeekMessageW, PostMessageW, TranslateMessage, MSG, PBT_APMRESUMEAUTOMATIC,
-    PM_REMOVE, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PM_REMOVE, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_ENDSESSION, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use wp_core::PhysicalRect;
 use wp_platform::{
     create_host_window, destroy_host_window, enumerate_monitors, is_minimized, paint_solid,
-    restore_window, BandState, DesktopHost, DcompSurface, HostWindowSpec, MonitorInfo, Strategy,
+    restore_window, BandState, DcompSurface, DesktopHost, HostWindowSpec, MonitorInfo, Strategy,
     TEST_COLOR, TEST_RGB,
 };
 
@@ -50,8 +50,15 @@ const EXIT_MONITOR_GONE: i32 = 76;
 /// 看门狗周期。与 `wpctl probe` 保持一致：单次修正失败可能是过渡窗口，5 次连续失败才报 `Lost`。
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 
+/// 暂停判定周期。全屏应用切进切出比 z 序漂移快，1 s 足够且开销可忽略。
+const PAUSE_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Parser, Debug)]
-#[command(name = "wp-host", version, about = "wallpaper 渲染宿主进程（每显示器一个）")]
+#[command(
+    name = "wp-host",
+    version,
+    about = "wallpaper 渲染宿主进程（每显示器一个）"
+)]
 struct Args {
     /// 显示器索引（0 起）。热插拔频繁时建议改用 `--device`
     #[arg(long, default_value_t = 0)]
@@ -71,6 +78,9 @@ struct Args {
     /// 运行秒数，0 表示一直运行到收到退出信号
     #[arg(long, default_value_t = 0)]
     duration: u64,
+    /// 关闭暂停判定（全屏应用 / 最大化遮挡 / 电池 / 远程会话）
+    #[arg(long)]
+    no_pause: bool,
     /// 跳过启动时的桌面自愈（仅用于验证自愈逻辑本身）
     #[arg(long)]
     no_heal: bool,
@@ -79,8 +89,7 @@ struct Args {
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -132,7 +141,7 @@ fn run() -> Result<i32> {
     install_console_handler();
     HOST_HWND.store(session.hwnd, Ordering::Relaxed);
 
-    let result = event_loop(&mut session, fps, duration);
+    let result = event_loop(&mut session, fps, duration, !args.no_pause);
 
     HOST_HWND.store(0, Ordering::Relaxed);
     // 顺序很重要：先放掉 DComp 表面，再把 DefView 还给 Progman，最后销毁窗口。
@@ -146,6 +155,7 @@ fn event_loop(
     session: &mut Session,
     fps: u32,
     duration: Option<Duration>,
+    pause_detection: bool,
 ) -> Result<i32> {
     let started = Instant::now();
     let frame_interval = frame_interval(session.content, fps);
@@ -153,6 +163,8 @@ fn event_loop(
     let mut events = Events::default();
     let mut next_check = Instant::now();
     let mut next_frame = Instant::now();
+    let mut next_pause_check = Instant::now();
+    let mut pause_reasons: Vec<wp_platform::PauseReason> = Vec::new();
     let mut was_paused = false;
     let mut corrections = 0u64;
 
@@ -206,6 +218,30 @@ fn event_loop(
         }
 
         let now = Instant::now();
+
+        // 暂停判定：全屏游戏 / 最大化窗口 / 电池 / 远程桌面 / 锁屏 / 休眠。
+        // 锁屏与休眠在上面已经走 `continue`，这里负责其余条件。
+        if pause_detection && now >= next_pause_check {
+            let report = wp_platform::pause::probe(
+                Some(session.hwnd),
+                session.rect,
+                wp_platform::PauseFlags {
+                    locked: events.locked,
+                    suspended: events.suspended,
+                    user_paused: false,
+                },
+            );
+            if report.reasons != pause_reasons {
+                if report.paused {
+                    tracing::info!(reasons = %report.summary(), "暂停渲染");
+                } else {
+                    tracing::info!("暂停条件消失，恢复渲染");
+                }
+                pause_reasons = report.reasons;
+            }
+            next_pause_check = now + PAUSE_INTERVAL;
+        }
+
         if now >= next_check {
             match session.host.ensure_band(session.hwnd) {
                 Ok(BandState::Correct) => {}
@@ -226,8 +262,10 @@ fn event_loop(
         }
 
         if now >= next_frame {
-            if let Err(e) = session.paint() {
-                tracing::warn!("绘制失败: {e}");
+            if pause_reasons.is_empty() {
+                if let Err(e) = session.paint() {
+                    tracing::warn!("绘制失败: {e}");
+                }
             }
             next_frame = now + frame_interval;
         }
@@ -261,7 +299,9 @@ fn resolve_monitor(device: Option<&str>, index: usize) -> Result<MonitorInfo> {
 }
 
 /// 显示器几何变化：按设备名找同一块屏；没变就什么都不做。
-fn refresh_geometry(session: &mut Session) -> std::result::Result<Option<PhysicalRect>, GeometryError> {
+fn refresh_geometry(
+    session: &mut Session,
+) -> std::result::Result<Option<PhysicalRect>, GeometryError> {
     let monitors = enumerate_monitors();
     let Some(monitor) = monitors
         .iter()
@@ -273,9 +313,7 @@ fn refresh_geometry(session: &mut Session) -> std::result::Result<Option<Physica
         return Ok(None);
     }
     let rect = monitor.rect;
-    session
-        .restart(rect)
-        .map_err(GeometryError::Failed)?;
+    session.restart(rect).map_err(GeometryError::Failed)?;
     Ok(Some(rect))
 }
 
@@ -376,12 +414,7 @@ impl Session {
             // 策略 E/F 让 DefView 成为子窗口，visual 必须在子窗口之下（topmost=false），
             // 否则图标会被 DComp 表面整块盖住（实测图标区异色像素归零）。
             let topmost = !matches!(strategy, Strategy::DefViewAdopt | Strategy::DefViewChild);
-            match DcompSurface::new(
-                hwnd,
-                monitor.rect.width,
-                monitor.rect.height,
-                topmost,
-            ) {
+            match DcompSurface::new(hwnd, monitor.rect.width, monitor.rect.height, topmost) {
                 Ok(surface) => Some(surface),
                 Err(e) => {
                     // 绝不能停在黑屏：拆掉 noredirection 窗口，用 GDI 纯色重来一次。
@@ -408,10 +441,10 @@ impl Session {
 
     fn paint(&mut self) -> Result<()> {
         match (&mut self.surface, self.content) {
-            (Some(surface), _) => surface
-                .clear(TEST_RGB)
-                .map_err(|e| anyhow::anyhow!(e)),
-            (None, Content::Gdi) => paint_solid(self.hwnd, TEST_COLOR).map_err(|e| anyhow::anyhow!(e)),
+            (Some(surface), _) => surface.clear(TEST_RGB).map_err(|e| anyhow::anyhow!(e)),
+            (None, Content::Gdi) => {
+                paint_solid(self.hwnd, TEST_COLOR).map_err(|e| anyhow::anyhow!(e))
+            }
             (None, Content::D3d) => Ok(()),
         }
     }
@@ -486,12 +519,7 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> windows::core::BOOL {
             let hwnd = HOST_HWND.load(Ordering::Relaxed);
             if hwnd != 0 {
                 let _ = unsafe {
-                    PostMessageW(
-                        Some(HWND(hwnd as *mut _)),
-                        WM_CLOSE,
-                        WPARAM(0),
-                        LPARAM(0),
-                    )
+                    PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0))
                 };
             }
             windows::core::BOOL(1)
@@ -508,7 +536,8 @@ fn install_console_handler() {
 
 fn install_session_notifications(hwnd: isize) {
     unsafe {
-        if let Err(e) = WTSRegisterSessionNotification(HWND(hwnd as *mut _), NOTIFY_FOR_THIS_SESSION)
+        if let Err(e) =
+            WTSRegisterSessionNotification(HWND(hwnd as *mut _), NOTIFY_FOR_THIS_SESSION)
         {
             tracing::warn!("会话通知注册失败（锁屏时不会自动暂停）: {e}");
         }
