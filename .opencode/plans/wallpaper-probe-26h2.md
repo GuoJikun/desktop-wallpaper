@@ -213,8 +213,8 @@ SendMessageTimeout(Progman, 0x052C, wParam=0xD, lParam=0) -> ret=1
 
 - [x] **Explorer 重启（`TaskbarCreated`）后重挂** —— 已实测，结论见 §7.5
 - [ ] 多显示器 / 混合 DPI
-- [ ] 锁屏解锁、RDP 重连
-- [ ] 全屏独占游戏时的暂停判定
+- [ ] 锁屏解锁、RDP 重连（判定代码已接好，尚未实机验证）
+- [x] **全屏应用 / 最大化窗口的暂停判定** —— 已实测，见 §7.9
 - [ ] 长时间（≥ 30 分钟）稳定性与 GPU 占用
 
 ### 7.5 Explorer 重启：必须重启渲染进程
@@ -313,5 +313,63 @@ Windows 会连带销毁子窗口，而 Explorer 不会自动重建图标层（�
 3. **测试工具不许藏别人的窗口**：截图时一律最小化而不是 `SW_HIDE`。
    隐藏的窗口会从任务栏和 `Alt+Tab` 里消失，进程一死就再也没人恢复（这也是上面「软件消失」的另一个来源）。
    同时把收起过的窗口写进 `%TEMP%\wallpaper-minimized-<pid>.txt`，下次启动自动还原。
+
+### 7.9 暂停判定：全屏 / 最大化 / 电池 / 远程会话
+
+实现：`wp-platform::pause`（纯函数决策 + Win32 采样），`wp-host` 每 1 s 采样一次，
+命中任一条件就停止绘制（看门狗继续跑，z 序不会因为暂停而失修）。
+
+| 判据 | 来源 | 实测 |
+|---|---|---|
+| 全屏应用 | 前台窗口矩形 ⊇ 显示器矩形 | 自测窗口铺满后判为 `fullscreen_app` |
+| 最大化窗口盖住本屏 | 前台窗口 `IsZoomed` + 同一 `HMONITOR` | 见下方「任务栏」坑 |
+| 电池供电且电量 ≤ 20% | `GetSystemPowerStatus` | 台式机无电池（返回未知，不暂停） |
+| 远程桌面会话 | `SM_REMOTESESSION` | 本机非 RDP |
+| 锁屏 / 休眠 | `WTS_SESSION_*` / `WM_POWERBROADCAST` | 已接线，未实机验证 |
+
+**坑 1：`SHQueryUserNotificationState` 不能用来判全屏。** 它看起来最权威，
+实际会把**我们自己那个全屏尺寸的宿主窗口**也算成「有全屏应用」：
+
+```
+宿主未运行：notification_state = 5（accepts_notifications）
+宿主运行时：notification_state = 2（busy），前台仍是 Chrome
+```
+
+按它暂停等于壁纸一挂上就永久暂停。所以该值只写进 `wpctl pause` 的报告供诊断，
+决策完全走前台窗口几何。真正的全屏游戏 / 无边窗口化游戏，前台矩形同样覆盖整屏，
+不会漏判。
+
+**坑 2：最大化窗口并不覆盖整屏。** 1920×1080 上 Chrome 最大化后矩形是
+`(-8,-8,1936,1048)`，比屏幕矮一条任务栏。只按「矩形 ⊇ 显示器矩形」判断，
+所有普通最大化窗口都会被漏掉（壁纸在它后面白跑）。因此判据是
+「矩形覆盖整屏 **或**（`IsZoomed` 且窗口在同一块屏上）」，
+前者报 `fullscreen_app`，后者报 `maximized_cover`。
+
+`wpctl pause` 自测输出（26H2）：
+
+```
+自测窗口已激活: true
+遮挡判定: true（fullscreen_app（有全屏应用在运行））
+销毁后恢复: true（maximized_cover（桌面被最大化窗口挡住））
+结论: 通过
+```
+
+端到端（`wp-host --duration 22` + 320×200 前台窗口交替）：
+
+```
+14:17:32 暂停渲染 reasons=fullscreen_app        ← 当时还没修坑 1（宿主自触发）
+14:17:39 暂停条件消失，恢复渲染                  ← 小窗口成为前台，不再遮挡
+14:17:45 暂停渲染 reasons=maximized_cover       ← 小窗口销毁，前台回到 Chrome
+14:17:54 运行时间到，正常退出
+```
+
+修掉坑 1 后复测：宿主运行、Chrome 最大化时报告
+`reasons=[maximized_cover]`、`notification_state=2`（仅诊断），暂停原因正确。
+结论：**暂停/恢复双向都生效，1 s 内切换**。小窗口模式（`--size 320x200`）
+专门用来观察 `wp-host` 的恢复路径，自身不做通过/失败断言。
+
+剩余：多屏下「全屏应用在哪块屏」目前按整会话处理（任一屏全屏 → 全部暂停），
+与 `docs/design.md` §7.1 一致；如果以后要按屏精细控制，需要改成
+`GetForegroundWindow` + 显示器匹配后再分发。
 
 

@@ -70,9 +70,9 @@
 | 多显示器 / 混合 DPI | 单屏环境，未验证 |
 | Explorer 重启 | **已实测**：进程内无解，须重启 `wp-host`（watchdog 报 `Lost`，端到端验证通过） |
 | `Win+D` | **已实测**：显示桌面会把 `Progman` 抬到宿主之上；改成把 `Progman` 压回底部后壁纸稳定（94.3%–99.0%，3 轮） |
-| 锁屏解锁、RDP 重连、休眠唤醒 | 未验证 |
+| 锁屏解锁、RDP 重连、休眠唤醒 | 事件已接线，未实机验证 |
 | 崩溃后桌面自愈 | **已实测**：硬杀会连 `DefView` 一起销毁 → 下次启动按崩溃记录自动重启 Explorer 恢复 |
-| 全屏独占游戏暂停判定 | 未验证 |
+| 全屏独占游戏暂停判定 | **已实测**：`wpctl pause` 自测 + `wp-host` 前台切换，1 s 内暂停/恢复（§7.9） |
 | 长时间（≥ 30 分钟）稳定性 / GPU 占用 | 只跑到 150 秒 |
 
 **M0 尚未收尾，仍不要开始写业务代码。**
@@ -189,6 +189,11 @@ cargo run -p wpctl -- probe --strategy progman_child_top --content d3d --duratio
 cargo run -p wpctl -- probe --strategy all --duration 30
 # 桌面输入基线（不带壁纸）
 cargo run -p wpctl -- input-test --minimize
+# 暂停判定：一次性采样 / 连续观察 / 自测遮挡（小窗口模式用于观察恢复）
+cargo run -p wpctl -- pause --json
+cargo run -p wpctl -- pause --watch 10
+cargo run -p wpctl -- pause --self-test
+cargo run -p wpctl -- pause --self-test --size 320x200 --hold 6000
 cargo run -p wpctl -- shot --out out\shot.bmp
 cargo run -p wpctl -- attach --monitor 0 --source <file|url>
 cargo tauri dev   # 在 apps/desktop 下
