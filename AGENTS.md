@@ -73,7 +73,7 @@
 | 锁屏解锁、RDP 重连、休眠唤醒 | 事件已接线，未实机验证 |
 | 崩溃后桌面自愈 | **已实测**：硬杀会连 `DefView` 一起销毁 → 下次启动按崩溃记录自动重启 Explorer 恢复 |
 | 全屏独占游戏暂停判定 | **已实测**：`wpctl pause` 自测 + `wp-host` 前台切换，1 s 内暂停/恢复（§7.9） |
-| 长时间（≥ 30 分钟）稳定性 / GPU 占用 | 只跑到 150 秒 |
+| 长时间（≥ 30 分钟）稳定性 / GPU 占用 | **已实测**：30 分钟 0 漂移、CPU 0.1%、GPU 0.5%、无泄漏（§7.10） |
 
 **M0 尚未收尾，仍不要开始写业务代码。**
 
@@ -194,6 +194,8 @@ cargo run -p wpctl -- pause --json
 cargo run -p wpctl -- pause --watch 10
 cargo run -p wpctl -- pause --self-test
 cargo run -p wpctl -- pause --self-test --size 320x200 --hold 6000
+# 稳定性长测：30 分钟，每 30 s 采样 CPU/GPU，产物在 out/
+pwsh -NoProfile -File scripts/soak-sampler.ps1 -Duration 1800
 cargo run -p wpctl -- shot --out out\shot.bmp
 cargo run -p wpctl -- attach --monitor 0 --source <file|url>
 cargo tauri dev   # 在 apps/desktop 下

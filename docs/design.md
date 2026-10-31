@@ -372,7 +372,7 @@ pub enum Event {
 
 ```rust
 pub enum PauseReason {
-    FullscreenApp,      // SHQueryUserNotificationState == QUNS_RUNNING_D3D_FULL_SCREEN
+    FullscreenApp,      // 前台窗口矩形覆盖整屏
     MaximizedCover,     // 同屏存在最大化窗口且未在忽略列表
     BatteryLow,
     SessionLocked,
@@ -383,6 +383,15 @@ pub enum PauseReason {
 ```
 
 任一命中即暂停（避免多屏时一屏播放一屏看视频时 CPU 抢占）。
+
+**实测修正（26H2，见 `.opencode/plans/wallpaper-probe-26h2.md` §7.9）**：
+
+- 不能用 `SHQueryUserNotificationState == QUNS_RUNNING_D3D_FULL_SCREEN` 判全屏。
+  我们自己的宿主窗口也是全屏尺寸，它会把状态顶成 `QUNS_BUSY(2)`，
+  于是壁纸一挂上就永久暂停。该值只作诊断，不参与决策。
+- 全屏改为「前台窗口矩形 ⊇ 显示器矩形」；最大化窗口止于任务栏，
+  矩形并不覆盖整屏，必须单独用 `IsZoomed` + 同一 `HMONITOR` 判定。
+- 桌面壳层（`Progman` / `WorkerW` / `SHELLDLL_DefView`）与宿主自身窗口不参与遮挡判定。
 
 ### 7.2 帧率与资源
 
