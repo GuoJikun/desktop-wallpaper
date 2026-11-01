@@ -223,7 +223,7 @@ fn main() -> Result<()> {
             no_pause,
             no_wait,
         } => attach(monitor, &source, &strategy, duration, no_pause, no_wait),
-        Cmd::Stop => stop_hosts(),
+        Cmd::Stop => stop_all(),
         Cmd::Pause {
             json,
             monitor,
@@ -354,9 +354,50 @@ fn attach(
         );
     }
 
-    let exe = host_exe()?;
     // 只看这一块屏：其它显示器有宿主不代表这块屏已经挂了壁纸。
     let before = wp_platform::host_windows_on(monitor.rect);
+
+    // supervisor 是常态入口：它记得每块屏的壁纸，崩溃 / Explorer 重启后能自己恢复。
+    // 只有「本屏还没有宿主」时才拉起它——老宿主在跑时贸然再起一个 supervisor，
+    // 它会再拉一个宿主，两个宿主抢同一块屏必出事故。
+    if duration == 0 {
+        match supervisor_load(monitor_idx, &source, Duration::from_millis(250)) {
+            Ok(Some((width, height))) => {
+                println!(
+                    "supervisor 已换图 → 显示器 [{monitor_idx}] {} {}x{}（解码后 {width}x{height}）",
+                    monitor.device, monitor.rect.width, monitor.rect.height
+                );
+                return Ok(());
+            }
+            Ok(None) if before == 0 => {
+                start_supervisor(monitor_idx, &source, strategy, no_pause)?;
+                match supervisor_load(monitor_idx, &source, Duration::from_secs(15))? {
+                    Some((width, height)) => {
+                        println!(
+                            "已由 supervisor 挂载 {} → 显示器 [{monitor_idx}] {} {}x{}（解码后 {width}x{height}）",
+                            source.display(),
+                            monitor.device,
+                            monitor.rect.width,
+                            monitor.rect.height
+                        );
+                        println!(
+                            "日志 {}；用 `wpctl stop` 优雅停止",
+                            supervisor_log_path().display()
+                        );
+                        return Ok(());
+                    }
+                    None => bail!(
+                        "supervisor 已启动但管道 {} 没有监听；日志 {}\n{}",
+                        supervisor_pipe(),
+                        supervisor_log_path().display(),
+                        log_tail(&supervisor_log_path(), 15)
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+    }
 
     // 优先走 IPC：宿主已经在跑时只换内容，不重建进程和桌面挂载。
     // 有宿主时多等一会儿——它可能刚被拉起，管道还没开始监听。
@@ -398,6 +439,7 @@ fn attach(
         .with_context(|| format!("创建日志 {} 失败", log.display()))?;
     let log_err = log_file.try_clone()?;
 
+    let exe = host_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--monitor")
         .arg(monitor_idx.to_string())
@@ -500,6 +542,105 @@ fn ipc_load(pipe: &str, source: &Path, timeout: Duration) -> Result<Option<(u32,
     }
 }
 
+fn supervisor_pipe() -> String {
+    wp_ipc::supervisor::pipe_name(wp_platform::current_session_id())
+}
+
+/// 让运行中的 supervisor 换图。
+///
+/// 返回 `Ok(None)` 表示 supervisor 没在跑，调用方可以决定是否拉起它。
+fn supervisor_load(
+    monitor_idx: usize,
+    source: &Path,
+    timeout: Duration,
+) -> Result<Option<(u32, u32)>> {
+    let pipe = supervisor_pipe();
+    let mut conn = match wp_ipc::pipe::connect(&pipe, timeout) {
+        Ok(conn) => conn,
+        Err(wp_ipc::pipe::PipeError::NotRunning) => return Ok(None),
+        Err(e) => bail!("连接 supervisor 管道 {pipe} 失败: {e}"),
+    };
+
+    wp_ipc::write_frame(
+        &mut conn,
+        &wp_ipc::supervisor::Command::LoadFile {
+            monitor: monitor_idx as u32,
+            path: source.to_path_buf(),
+        },
+    )
+    .context("发送 supervisor 换图命令失败")?;
+
+    let event: wp_ipc::supervisor::Event =
+        wp_ipc::read_frame(&mut conn).context("读取 supervisor 回应失败")?;
+    match event {
+        wp_ipc::supervisor::Event::Loaded { width, height, .. } => Ok(Some((width, height))),
+        wp_ipc::supervisor::Event::Error { code, message, .. } => {
+            bail!("supervisor 拒绝换图（{code:?}）: {message}")
+        }
+        other => bail!("supervisor 返回了意料之外的事件: {other:?}"),
+    }
+}
+
+fn supervisor_exe() -> Result<PathBuf> {
+    let me = std::env::current_exe().context("无法定位 wpctl 自身路径")?;
+    let dir = me.parent().context("无法定位 wpctl 所在目录")?;
+    let exe = dir.join("wp-supervisor.exe");
+    if !exe.is_file() {
+        bail!(
+            "找不到 {}，先运行 `cargo build -p wp-supervisor`",
+            exe.display()
+        );
+    }
+    Ok(exe)
+}
+
+fn supervisor_log_path() -> PathBuf {
+    std::env::temp_dir().join("wallpaper-supervisor.log")
+}
+
+/// 拉起 supervisor。它自己会再拉 `wp-host`，所以调用方不应该同时直连宿主。
+fn start_supervisor(
+    monitor_idx: usize,
+    source: &Path,
+    strategy: &str,
+    no_pause: bool,
+) -> Result<()> {
+    let exe = supervisor_exe()?;
+    let log = supervisor_log_path();
+    // 共享读写：运行时也能 tail。
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(0x7)
+        .open(&log)
+        .with_context(|| format!("创建日志 {} 失败", log.display()))?;
+    let err = file.try_clone()?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--monitor")
+        .arg(monitor_idx.to_string())
+        .arg("--image")
+        .arg(source)
+        .arg("--strategy")
+        .arg(strategy);
+    if no_pause {
+        cmd.arg("--no-pause");
+    }
+    let child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(file))
+        .stderr(std::process::Stdio::from(err))
+        .spawn()
+        .with_context(|| format!("启动 {} 失败", exe.display()))?;
+    println!(
+        "已启动 supervisor（pid {}），日志 {}",
+        child.id(),
+        log.display()
+    );
+    Ok(())
+}
+
 /// 每个显示器一份日志，重复 attach 会覆盖（只留最近一次）。
 fn host_log_path(monitor_idx: usize) -> PathBuf {
     std::env::temp_dir().join(format!("wallpaper-host-{monitor_idx}.log"))
@@ -518,7 +659,49 @@ fn log_tail(path: &Path, lines: usize) -> String {
     all[start..].join("\n")
 }
 
-/// `wpctl stop`：给所有宿主窗口发 `WM_CLOSE`，等它们自己把桌面还回去。
+/// `wpctl stop`：先请 supervisor 停掉它管的宿主；没有 supervisor 才直发 `WM_CLOSE`。
+fn stop_all() -> Result<()> {
+    if shutdown_supervisor()? {
+        // supervisor 回复前已经等过子进程退出，这里再兜底确认窗口确实没了。
+        return wait_hosts_gone();
+    }
+    stop_hosts()
+}
+
+fn shutdown_supervisor() -> Result<bool> {
+    let pipe = supervisor_pipe();
+    let mut conn = match wp_ipc::pipe::connect(&pipe, Duration::from_millis(500)) {
+        Ok(conn) => conn,
+        Err(wp_ipc::pipe::PipeError::NotRunning) => return Ok(false),
+        Err(e) => bail!("连接 supervisor 管道 {pipe} 失败: {e}"),
+    };
+    wp_ipc::write_frame(&mut conn, &wp_ipc::supervisor::Command::Shutdown)
+        .context("发送 supervisor 退出命令失败")?;
+    let event: wp_ipc::supervisor::Event =
+        wp_ipc::read_frame(&mut conn).context("读取 supervisor 退出回应失败")?;
+    match event {
+        wp_ipc::supervisor::Event::Stopped => {
+            println!("supervisor 已停止全部宿主");
+            Ok(true)
+        }
+        other => bail!("supervisor 返回了意料之外的事件: {other:?}"),
+    }
+}
+
+fn wait_hosts_gone() -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if wp_platform::host_windows().is_empty() {
+            println!("全部退出，桌面已还原");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let left = wp_platform::host_windows().len();
+    bail!("{left} 个宿主窗口 5 秒内没有退出；请查看日志，不要用 Stop-Process 硬杀");
+}
+
+/// `wpctl stop` 的兜底路径：给所有宿主窗口发 `WM_CLOSE`，等它们自己把桌面还回去。
 fn stop_hosts() -> Result<()> {
     let count = wp_platform::close_host_windows();
     if count == 0 {
@@ -526,18 +709,7 @@ fn stop_hosts() -> Result<()> {
         return Ok(());
     }
     println!("已向 {count} 个宿主窗口发送 WM_CLOSE，等待退出…");
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let left = wp_platform::host_windows().len();
-        if left == 0 {
-            println!("全部退出，桌面已还原");
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let left = wp_platform::host_windows().len();
-    bail!("{left} 个宿主窗口 5 秒内没有退出；请查看 wp-host 日志，不要用 Stop-Process 硬杀");
+    wait_hosts_gone()
 }
 
 /// `wp-host.exe` 与本工具同目录（都是 cargo 产物）。找不到时给出可操作的提示。
