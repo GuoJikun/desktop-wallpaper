@@ -63,6 +63,8 @@
 - 策略 A / B / D 全部证否并记录原因（见 `.opencode/plans/wallpaper-probe-26h2.md` §6–§7）。
 - **M1 图片壁纸最小闭环**：`wp-render` 解码 + cover 缩放 → BGRA，`DcompSurface::draw_bgra`
   一次 `UpdateSubresource` 上屏，`wp-host --image`，`wpctl attach|stop`（见 `docs/implementation.md` §4.4）。
+- **M1 IPC 换图**：`wp-ipc` 命名管道（`Command::LoadFile` / `Event::Loaded`），
+  `wpctl attach` 复用运行中的宿主换图，不重启进程（`--no-ipc` 可关）。
 
 ### 最高风险（M0 收尾要解决）
 挂载机制已确定，剩下的是**边界条件**而不是可行性：
@@ -207,6 +209,7 @@ cargo run -p wpctl -- shot --out out\shot.bmp
 # M1 图片壁纸：挂一张图（默认常驻），验证完优雅停掉
 cargo run -p wpctl -- attach --monitor 0 --source out\wp-test-quadrant.png
 cargo run -p wpctl -- attach --monitor 0 --source <png|jpg|bmp> --no-pause   # 调试：不因前台全屏暂停
+# 宿主已在跑时，上面这条 attach 走 IPC 直接换图（不重启进程）；`--no-ipc` 可关掉管道
 cargo run -p wpctl -- stop
 cargo tauri dev   # 在 apps/desktop 下
 ```

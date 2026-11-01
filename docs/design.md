@@ -360,6 +360,8 @@ LICENSE.txt
 ```rust
 pub enum Command {
     Load { item: WallpaperId, spec: WallpaperSpec, rect: Rect },
+    /// M1 已实现：直接换一个本地文件，宿主自己解码、缩放、上屏。
+    LoadFile { path: PathBuf },
     Unload,
     Pause { reason: PauseReason },
     Resume,
@@ -373,16 +375,22 @@ pub enum Command {
 
 pub enum Event {
     Ready { backend: String },
+    /// `LoadFile` 成功：回传实际解码后的尺寸，调用方据此确认换图生效。
+    Loaded { path: String, width: u32, height: u32 },
     Stats { fps: f32, cpu: f32, gpu_mem_mb: u32 },
     Error { code: ErrorCode, message: String },
     Log { level: u8, message: String },
 }
 ```
 
+M1 只实现「一问一答」：客户端发 `LoadFile`，宿主回 `Loaded` 或 `Error`。
+`Ready` 握手和 `Stats` 心跳等 supervisor 落地时再加——那需要读超时或异步 IO，
+现在用同步阻塞的 `File` 读写最简单可靠。
+
 ### 6.3 生命周期
 
 1. Supervisor spawn `wp-host --monitor N --token <random>`
-2. host 创建 HWND、attach 桌面、连接管道
+2. host 创建 HWND、attach 桌面、再开始监听管道（先挂好桌面才允许换图）
 3. host 发 `Ready`；超时 5 s 未就绪则杀掉重启
 4. 运行期心跳：host 每 2 s 发 `Stats`；30 s 无消息视为失联
 

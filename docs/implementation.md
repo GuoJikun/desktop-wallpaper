@@ -164,7 +164,7 @@ wpctl probe --strategy all --content gdi,d3d --duration 30 --report out/report.j
 ### 4.2 任务顺序
 
 1. `wp-core` 领域模型 + SQLite schema
-2. `wp-ipc` 协议与管道实现（含超时、重连）
+2. ✅ `wp-ipc` 协议与管道实现（命名管道 + 连接超时；`Stats` 推送待 supervisor）
 3. ✅ `wp-host` 骨架：窗口 + 图片后端（最小闭环）
 4. ✅ `wpctl attach` 打通：能手动挂一张图
 5. 视频后端：外部 mpv 进程（**等许可证定稿**）
@@ -186,6 +186,7 @@ wpctl probe --strategy all --content gdi,d3d --duration 30 --report out/report.j
 | 上屏 | `DcompSurface::draw_bgra`：`UpdateSubresource` 写交换链后备缓冲 + `Present` |
 | 宿主 | `wp-host --image <path>`：先解码再建窗口；静态图只提交一帧 |
 | 控制 | `wpctl attach --monitor N --source <file>`（另有 `--no-pause` / `--duration`）、`wpctl stop` |
+| 换图 | `wp-ipc` 命名管道 `\\.\pipe\wallpaper-host-{session}-{monitor}`：`Command::LoadFile` → `Event::Loaded`；`attach` 复用运行中的宿主，不重启进程 |
 
 实测（单屏 1920×1080，策略 E + DComp）：
 
@@ -195,10 +196,12 @@ wpctl probe --strategy all --content gdi,d3d --duration 30 --report out/report.j
 | 同一张图存成 PNG / JPEG / BMP | 三种格式平均色都是 `RGB(130,132,66)`，解码器全部走通 |
 | 1600×1200 三条横带（比屏幕「高」） | cover 后上/下各裁 180 px，只剩 300 / 480 / 300 行的红绿蓝，证明是裁切而不是拉伸 |
 | 损坏的 `.png` | `wp-host` 在创建窗口前退出（exit 1），`wpctl attach` 打印日志里的解码错误 |
+| 热换图（四象限 → 三条横带） | 同一个 `wp-host`（pid 不变、无新窗口），截图平均色从 `RGB(130,132,66)` 变为 `RGB(80,122,70)` |
+| 热换图失败（损坏的 `.png`） | 宿主回 `Error(Decode)` 并保留原壁纸（截图颜色不变），`attach` 报完整错误链、不另起进程 |
 
 已知约束：
 
-- 还没接 IPC：`attach` 直接拉起进程，换壁纸要 `stop` 再 `attach`。
+- IPC 目前只做「一问一答」（`LoadFile`）；`Stats` 推送、`Ready` 握手等留给 supervisor。
 - 幻灯片、多屏分配、配置落库尚未做。
 - 截图验证时前台若被全屏 / 最大化窗口占着，暂停判定会让壁纸先停绘——
   这是正确行为，调试时加 `--no-pause`。
