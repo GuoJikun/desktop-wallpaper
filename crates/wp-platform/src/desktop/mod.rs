@@ -142,6 +142,22 @@ impl std::fmt::Display for PlatformError {
 
 impl std::error::Error for PlatformError {}
 
+/// 桌面壳层是否已经建好（图标层和图标列表都在）。
+///
+/// Explorer 重启后 `SHELLDLL_DefView` 很快就存在，但 `SysListView32` 要晚一步。
+/// 在图标列表建好之前接管，拿到的 `DefView` 是不透明的：壁纸在渲染但被整块盖住
+/// （实测非黑占比 5%，把 `DefView` 缩小后立刻恢复）。
+/// supervisor 用它决定 Explorer 重启后「什么时候可以拉起新的 `wp-host`」。
+pub fn shell_ready() -> bool {
+    let Some(progman) = probe::progman() else {
+        return false;
+    };
+    let Some(defview) = probe::find_child(progman, "SHELLDLL_DefView", None) else {
+        return false;
+    };
+    probe::find_child(defview, "SysListView32", None).is_some()
+}
+
 /// 显示器标识包装，便于在日志中区分。
 pub fn monitor_label(key: &MonitorKey) -> &str {
     key.as_str()

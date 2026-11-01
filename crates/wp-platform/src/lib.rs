@@ -15,9 +15,9 @@ pub mod window;
 pub use capture::{capture, save_bmp, ScreenImage};
 pub use dcomp::DcompSurface;
 pub use desktop::{
-    defview_handle, defview_state, heal_desktop, progman_z, resize_defview, z_chain, z_index_of,
-    BandState, DefViewChild, DesktopHost, PlatformError, ProbeReport, Strategy, TopLevelBottom,
-    WorkerWInfo,
+    defview_handle, defview_state, heal_desktop, progman_z, resize_defview, shell_ready, z_chain,
+    z_index_of, BandState, DefViewChild, DesktopHost, PlatformError, ProbeReport, Strategy,
+    TopLevelBottom, WorkerWInfo,
 };
 pub use input::{
     desktop_pid, new_top_level, press_escape, press_win_d, right_click, snapshot_top_level,

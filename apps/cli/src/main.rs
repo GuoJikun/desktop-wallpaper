@@ -315,6 +315,72 @@ fn probe(
 /// M1 支持的图片扩展名。URL / 壁纸包留到 M2。
 const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "bmp"];
 
+/// 挂载成功后抽查一次「屏幕上真的看得见吗」。
+///
+/// Explorer 重启后新建的图标层会不透明地盖住壁纸（黑屏，或者干脆自己画成系统壁纸），
+/// 宿主会在两秒内自动退回系统壁纸（退出码 77）。这里给出同样的提示，
+/// 免得用户以为壁纸已经挂上了。
+///
+/// 判据是「整屏单一纯色」：真实的图片壁纸几乎不可能只有一个颜色，
+/// 而黑屏和系统默认壁纸都是。与宿主里的判定保持同一种保守思路。
+fn warn_if_invisible(rect: wp_core::PhysicalRect) {
+    // 宿主大约 2.4 s 后才退出，采太早会撞上「黑屏 → 系统壁纸」的切换瞬间，两边都不像。
+    // 连采几次，任意一次「整屏纯色」就提示。
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(1200));
+        if screen_is_flat(rect) {
+            eprintln!(
+                "警告：屏幕上看不到壁纸（桌面图标层不透明），宿主会退回系统壁纸。\n\
+                 这是 Explorer 重启后的已知问题，见 docs/implementation.md §4.4。"
+            );
+            return;
+        }
+    }
+}
+
+/// 屏幕是不是「整块单一纯色」。
+fn screen_is_flat(rect: wp_core::PhysicalRect) -> bool {
+    let Ok(screen) = wp_platform::capture(rect) else {
+        return false;
+    };
+    let mut min = [255u8; 3];
+    let mut max = [0u8; 3];
+    // 采样点与 `wp-host` 的自检保持一致：避开左侧图标列和底部任务栏。
+    for (fx, fy) in [
+        (0.30, 0.20),
+        (0.45, 0.20),
+        (0.60, 0.20),
+        (0.75, 0.20),
+        (0.90, 0.20),
+        (0.30, 0.40),
+        (0.45, 0.40),
+        (0.60, 0.40),
+        (0.75, 0.40),
+        (0.90, 0.40),
+        (0.30, 0.60),
+        (0.45, 0.60),
+        (0.60, 0.60),
+        (0.75, 0.60),
+        (0.90, 0.60),
+        (0.30, 0.80),
+        (0.45, 0.80),
+        (0.60, 0.80),
+        (0.75, 0.80),
+        (0.90, 0.80),
+    ] {
+        let x = (rect.width as f32 * fx) as u32;
+        let y = (rect.height as f32 * fy) as u32;
+        let Some(px) = screen.pixel(x, y) else {
+            continue;
+        };
+        for c in 0..3 {
+            min[c] = min[c].min(px[c]);
+            max[c] = max[c].max(px[c]);
+        }
+    }
+    (0..3).all(|c| max[c].saturating_sub(min[c]) <= 20)
+}
+
 /// `wpctl attach`：拉起一个 `wp-host` 子进程把图片挂到指定显示器。
 ///
 /// 选择「子进程」而不是进程内挂载，是因为渲染必须与 UI / 调试工具隔离：
@@ -367,6 +433,7 @@ fn attach(
                     "supervisor 已换图 → 显示器 [{monitor_idx}] {} {}x{}（解码后 {width}x{height}）",
                     monitor.device, monitor.rect.width, monitor.rect.height
                 );
+                warn_if_invisible(monitor.rect);
                 return Ok(());
             }
             Ok(None) if before == 0 => {
@@ -384,6 +451,7 @@ fn attach(
                             "日志 {}；用 `wpctl stop` 优雅停止",
                             supervisor_log_path().display()
                         );
+                        warn_if_invisible(monitor.rect);
                         return Ok(());
                     }
                     None => bail!(
@@ -496,6 +564,7 @@ fn attach(
                 monitor.rect.height
             );
             println!("日志 {}；用 `wpctl stop` 优雅停止", log.display());
+            warn_if_invisible(monitor.rect);
             return Ok(());
         }
         if Instant::now() >= deadline {

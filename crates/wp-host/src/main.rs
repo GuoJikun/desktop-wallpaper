@@ -9,6 +9,7 @@
 //! | 1 | 启动失败或运行时错误 | 退避后重启 |
 //! | 75 | `ensure_band() == Lost`（Explorer 换了桌面壳层） | **必须重启本进程**，进程内无解 |
 //! | 76 | 目标显示器已移除 | 停止该显示器的渲染，等热插拔事件 |
+//! | 77 | 壁纸被新 `DefView` 整块盖住（屏幕只剩一片单色） | 退回系统壁纸，**不要自动重试**（重试还是被盖住） |
 //!
 //! 生命周期：
 //!
@@ -51,12 +52,23 @@ use wp_platform::{
 const EXIT_RESTART: i32 = 75;
 /// 目标显示器已不存在，停止该屏渲染。
 const EXIT_MONITOR_GONE: i32 = 76;
+/// 壁纸在屏幕上完全看不到（被不透明的 `DefView` 盖住），已退回系统壁纸。
+const EXIT_COVERED: i32 = 77;
 
 /// 看门狗周期。与 `wpctl probe` 保持一致：单次修正失败可能是过渡窗口，5 次连续失败才报 `Lost`。
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 暂停判定周期。全屏应用切进切出比 z 序漂移快，1 s 足够且开销可忽略。
 const PAUSE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 覆盖自检：挂上去之后先等画面稳定，再做第一次采样。
+const VISIBLE_FIRST_CHECK: Duration = Duration::from_millis(1500);
+/// 覆盖自检周期。
+const VISIBLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// 已经怀疑被盖住时的复查间隔。
+const COVERED_RECHECK: Duration = Duration::from_millis(700);
+/// 连续多少次判定「看不到壁纸」才放弃。中间一次采样可能撞上重绘，不算数。
+const COVERED_STRIKES: u32 = 2;
 
 /// 事件触发的 z 序核对最小间隔。
 ///
@@ -278,6 +290,8 @@ fn event_loop(
     let mut event_checks = 0u64;
     let mut next_frame = Instant::now();
     let mut next_pause_check = Instant::now();
+    let mut next_visible_check = Instant::now() + VISIBLE_FIRST_CHECK;
+    let mut covered_strikes = 0u32;
     let mut pause_reasons: Vec<wp_platform::PauseReason> = Vec::new();
     let mut was_paused = false;
     let mut corrections = 0u64;
@@ -423,6 +437,36 @@ fn event_loop(
                 }
             }
             next_frame = now + frame_interval;
+        }
+
+        // 覆盖自检：Explorer 重启后新的图标层会自己画一层不透明背景，把壁纸整块盖住。
+        // 那一刻桌面是全黑的，用户没有任何入口知道「壁纸其实还在画」。
+        // 暂停状态（全屏应用、锁屏）下屏幕本来就该被别的窗口盖住，不检查。
+        if now >= next_visible_check && pause_reasons.is_empty() {
+            match session.visible_on_screen() {
+                Ok(true) => {
+                    covered_strikes = 0;
+                }
+                Ok(false) => {
+                    covered_strikes += 1;
+                    tracing::warn!(strikes = covered_strikes, "屏幕上看不到壁纸");
+                    if covered_strikes >= COVERED_STRIKES {
+                        // 兜底：宁可退回系统壁纸，也绝不停在黑屏上（硬规则 9）。
+                        tracing::error!(
+                            "壁纸被桌面图标层整块盖住（26H2 Explorer 重启后的已知问题），退回系统壁纸"
+                        );
+                        return Ok(EXIT_COVERED);
+                    }
+                }
+                Err(e) => tracing::debug!("可见性自检失败: {e}"),
+            }
+            // 已经怀疑被盖住就快一点复查：黑屏每一秒都是用户可见的缺陷。
+            next_visible_check = now
+                + if covered_strikes > 0 {
+                    COVERED_RECHECK
+                } else {
+                    VISIBLE_CHECK_INTERVAL
+                };
         }
 
         // 空转会烧 CPU；16 ms 一帧时这个睡眠就是「等到下一帧」的粗略实现。
@@ -658,6 +702,24 @@ fn pump_messages(events: &mut Events) {
     }
 }
 
+/// 自检采样点（相对宿主窗口的像素坐标）。
+///
+/// 避开左侧图标列和底部任务栏：那两处永远不是壁纸，拿来比较只会误导。
+fn visible_probe_points(rect: PhysicalRect) -> Vec<(u32, u32)> {
+    const XS: [f32; 5] = [0.30, 0.45, 0.60, 0.75, 0.90];
+    const YS: [f32; 4] = [0.20, 0.40, 0.60, 0.80];
+    let mut points = Vec::with_capacity(XS.len() * YS.len());
+    for y in YS {
+        for x in XS {
+            points.push((
+                (rect.width as f32 * x) as u32,
+                (rect.height as f32 * y) as u32,
+            ));
+        }
+    }
+    points
+}
+
 /// 一次「窗口 + 挂载 + 表面」的完整会话。
 ///
 /// 显示器几何变化或 D3D 降级时整段重建：窗口样式在创建时确定
@@ -749,6 +811,77 @@ impl Session {
             image_path: image_path.map(Path::to_path_buf),
             dirty: true,
         })
+    }
+
+    /// 内容在窗口内 (x, y) 处应该是的颜色。原点在窗口左上角。
+    fn expected_rgb(&self, x: u32, y: u32) -> Option<[u8; 3]> {
+        if let Some(image) = self.image.as_ref() {
+            if x >= image.width || y >= image.height {
+                return None;
+            }
+            let offset = (y as usize * image.width as usize + x as usize) * 4;
+            let px = image.pixels.get(offset..offset + 4)?;
+            // BGRA
+            return Some([px[2], px[1], px[0]]);
+        }
+        Some(TEST_RGB)
+    }
+
+    /// 壁纸是否真的出现在屏幕上。
+    ///
+    /// 判定分三步，条件刻意收得很紧——别的窗口挡住一部分、用户开着深色全屏应用
+    /// 都不该被误判（宁可漏报，也不能错误地把壁纸撤掉）：
+    ///
+    /// 1. 采样点上能对上我们该画的像素 → 可见；
+    /// 2. 一个都对不上，但屏幕本身「有内容」（采样点颜色不一致）→ 是别的窗口盖着，也算可见；
+    /// 3. 屏幕整块单色、又没有一处是我们的像素 → 被 `DefView` 自己画的背景盖住了。
+    ///
+    /// 第 3 条正是 Explorer 重启后的已知现象：新 `SHELLDLL_DefView` 会自己画一层不透明
+    /// 背景（黑屏，或者干脆是系统壁纸），把我们的 DComp 内容整块盖住。
+    /// 实测：把 `DefView` 缩小到 400×300，壁纸立刻露出来。
+    fn visible_on_screen(&self) -> Result<bool> {
+        let screen = wp_platform::capture(self.rect).map_err(|e| anyhow::anyhow!(e))?;
+        let mut expected_pixels = Vec::new();
+        let mut actual_pixels = Vec::new();
+        for (x, y) in visible_probe_points(self.rect) {
+            let Some(expected) = self.expected_rgb(x, y) else {
+                continue;
+            };
+            let Some(actual) = screen.pixel(x, y) else {
+                continue;
+            };
+            expected_pixels.push(expected);
+            actual_pixels.push(actual);
+        }
+        // 一个点都采不到（窗口太小之类）：不下结论。
+        if expected_pixels.is_empty() {
+            return Ok(true);
+        }
+
+        let close = |want: &[u8; 3], got: &[u8; 3]| {
+            want.iter()
+                .zip(got.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(255)
+                <= 16
+        };
+        if expected_pixels
+            .iter()
+            .zip(actual_pixels.iter())
+            .any(|(want, got)| close(want, got))
+        {
+            return Ok(true);
+        }
+
+        // 屏幕上本来就五颜六色：多半是应用窗口盖在上面，不是这个 bug。
+        let spread = |channel: usize| {
+            let min = actual_pixels.iter().map(|p| p[channel]).min().unwrap_or(0);
+            let max = actual_pixels.iter().map(|p| p[channel]).max().unwrap_or(0);
+            max - min
+        };
+        let uniform = (0..3).all(|c| spread(c) <= 20);
+        Ok(!uniform)
     }
 
     fn paint(&mut self) -> Result<()> {

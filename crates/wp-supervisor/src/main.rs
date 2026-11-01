@@ -39,12 +39,18 @@ use wp_platform::{MonitorInfo, Strategy};
 const EXIT_RESTART: i32 = 75;
 /// 宿主的目标显示器已不存在。
 const EXIT_MONITOR_GONE: i32 = 76;
+/// 宿主看不到自己的画面（被 Explorer 新建的不透明图标层整块盖住），已退回系统壁纸。
+const EXIT_COVERED: i32 = 77;
 
 /// 运行满这么久之后再崩溃，退避计数从头算——避免「偶发崩溃」把下次延迟拖到 30 s。
 const STABLE_AFTER: Duration = Duration::from_secs(30);
 
 /// Explorer 重启后的快速重启延迟：新壳层已经就绪，慢一步桌面就是黑的。
 const EXPLORER_RESTART_DELAY: Duration = Duration::from_millis(300);
+
+/// 等新桌面壳层建好的上限。Explorer 一般 1–2 s 内就有图标列表，超过这个时间
+/// 说明它自己卡住了，再等也没意义，直接拉起宿主（至少图标层会由我们接管）。
+const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 主循环轮询间隔。只在等子进程退出和重试时间点，25 ms 足够且几乎不占 CPU。
 const TICK: Duration = Duration::from_millis(25);
@@ -246,6 +252,13 @@ struct Worker {
     started: Option<Instant>,
     restart_at: Option<Instant>,
     failures: u32,
+    /// 等新的桌面壳层建好再拉起（只走 Explorer 重启路径）。
+    ///
+    /// 新 shell 的 `SHELLDLL_DefView` 在 `SysListView32` 建好之前是不透明的，
+    /// 抢在这之前接管，壁纸会被整块盖住且进程内无法补救。
+    wait_shell: bool,
+    /// 等壳层的截止时间，超过就照常拉起，别让桌面一直空白。
+    shell_deadline: Option<Instant>,
 }
 
 impl Worker {
@@ -324,14 +337,27 @@ impl Supervisor {
                 EXIT_MONITOR_GONE => {
                     tracing::warn!(monitor = worker.monitor, pid, "显示器已移除，停止该屏渲染");
                 }
+                EXIT_COVERED => {
+                    // 自动重试只会再黑一次：这个状态要等 Explorer 自己恢复。
+                    worker.failures = 0;
+                    worker.restart_at = None;
+                    tracing::warn!(
+                        monitor = worker.monitor,
+                        pid,
+                        "壁纸被桌面图标层盖住，已退回系统壁纸；下次换图时再试"
+                    );
+                }
                 EXIT_RESTART => {
                     worker.failures = 0;
+                    worker.wait_shell = true;
+                    worker.shell_deadline = Some(now + SHELL_READY_TIMEOUT);
                     worker.restart_at = Some(now + EXPLORER_RESTART_DELAY);
                     tracing::warn!(
                         monitor = worker.monitor,
                         pid,
                         delay_ms = EXPLORER_RESTART_DELAY.as_millis(),
-                        "桌面壳层已更换，立即重启宿主"
+                        timeout_s = SHELL_READY_TIMEOUT.as_secs(),
+                        "桌面壳层已更换，等新壳层建好后重启宿主"
                     );
                 }
                 _ => {
@@ -362,6 +388,12 @@ impl Supervisor {
             .workers
             .iter()
             .filter(|w| w.child.is_none() && w.restart_at.is_some_and(|t| t <= now))
+            // Explorer 重启路径要等新壳层建好；超时则不再等。
+            .filter(|w| {
+                !w.wait_shell
+                    || w.shell_deadline.is_some_and(|d| now >= d)
+                    || wp_platform::shell_ready()
+            })
             .map(|w| w.monitor)
             .collect();
         for monitor in due {
@@ -419,6 +451,8 @@ impl Supervisor {
             started: Some(Instant::now()),
             restart_at: None,
             failures: 0,
+            wait_shell: false,
+            shell_deadline: None,
         });
         Ok(())
     }
@@ -434,6 +468,8 @@ impl Supervisor {
             worker.child = Some(child);
             worker.started = Some(Instant::now());
             worker.restart_at = None;
+            worker.wait_shell = false;
+            worker.shell_deadline = None;
         }
         tracing::info!(monitor, pid, "wp-host 已重启");
         Ok(())
@@ -462,7 +498,19 @@ impl Supervisor {
             worker.rect = info.rect;
             worker.device = info.device.clone();
             // 正在等重启的（例如 Explorer 刚重启过）现在就拉起来，别让客户端干等。
+            // 但新壳层还没建好时不抢跑：那时候接管会得到不透明的图标层。
             if worker.child.is_none() {
+                if worker.wait_shell {
+                    let ready = worker.shell_deadline.is_some_and(|d| Instant::now() >= d)
+                        || wp_platform::shell_ready();
+                    if !ready {
+                        return SupEvent::Error {
+                            monitor: Some(monitor as u32),
+                            code: ErrorCode::Internal,
+                            message: "桌面壳层正在重建，稍后重试".into(),
+                        };
+                    }
+                }
                 worker.image = Some(path.clone());
                 worker.restart_at = None;
                 if let Err(e) = self.restart_worker(monitor) {
@@ -497,6 +545,16 @@ impl Supervisor {
                             monitor: Some(monitor as u32),
                             code: ErrorCode::Internal,
                             message: "桌面壳层刚更换，宿主正在自动重启，请重试".into(),
+                        };
+                    }
+                    EXIT_COVERED => {
+                        self.drop_worker(monitor);
+                        return SupEvent::Error {
+                            monitor: Some(monitor as u32),
+                            code: ErrorCode::Internal,
+                            message:
+                                "壁纸被桌面图标层盖住（Explorer 重启后的已知问题），已退回系统壁纸"
+                                    .into(),
                         };
                     }
                     _ => {
@@ -572,7 +630,12 @@ impl Supervisor {
         worker.started = None;
         // 命令路径上的退出不安排自动重启：坏图重试只会白烧 CPU。
         worker.restart_at = None;
+        worker.wait_shell = false;
+        worker.shell_deadline = None;
         if code == EXIT_RESTART {
+            // 壳层刚换过，重启计划已经排好，但要等新壳层建好再拉起。
+            worker.wait_shell = true;
+            worker.shell_deadline = Some(Instant::now() + SHELL_READY_TIMEOUT);
             worker.restart_at = Some(Instant::now() + EXPLORER_RESTART_DELAY);
         }
         Some((code, ran))
@@ -756,6 +819,8 @@ mod tests {
     fn exit_codes_are_distinct() {
         assert_eq!(EXIT_RESTART, 75);
         assert_eq!(EXIT_MONITOR_GONE, 76);
+        assert_eq!(EXIT_COVERED, 77);
         assert_ne!(EXIT_RESTART, EXIT_MONITOR_GONE);
+        assert_ne!(EXIT_COVERED, EXIT_RESTART);
     }
 }
