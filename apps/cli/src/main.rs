@@ -104,6 +104,30 @@ enum Cmd {
         #[arg(long)]
         size: Option<String>,
     },
+    /// 最小化/还原循环压测：反复切换前台后核对层级（M0 验收第 3 条）
+    Cycles {
+        /// 循环次数
+        #[arg(long, default_value_t = 20)]
+        count: u32,
+        /// 挂载策略，默认 26H2 主力策略
+        #[arg(long, default_value = "defview_adopt")]
+        strategy: String,
+        /// 测试内容：`d3d` 画 DirectComposition，`gdi` 画纯色
+        #[arg(long, default_value = "d3d")]
+        content: String,
+        /// 显示器索引
+        #[arg(long, default_value_t = 0)]
+        monitor: usize,
+        /// 每次最小化 / 还原后的等待毫秒数
+        #[arg(long, default_value_t = 800)]
+        settle: u64,
+        /// 最后一轮之后截图（可选），用于人工确认画面仍可见
+        #[arg(long)]
+        shot: Option<PathBuf>,
+        /// 以 JSON 输出
+        #[arg(long)]
+        json: bool,
+    },
     /// 查看渲染进程状态
     Stats,
     /// 在桌面上模拟右键，验证桌面输入是否正常（基线对照用）
@@ -197,6 +221,23 @@ fn main() -> Result<()> {
             hold,
             size,
         } => pause_cmd(json, monitor, watch, self_test, hold, size.as_deref()),
+        Cmd::Cycles {
+            count,
+            strategy,
+            content,
+            monitor,
+            settle,
+            shot,
+            json,
+        } => run_cycles(
+            count,
+            &strategy,
+            &content,
+            monitor,
+            settle,
+            shot.as_deref(),
+            json,
+        ),
         Cmd::Stats => bail!("stats 尚未实现（M1）"),
     }
 }
@@ -684,6 +725,219 @@ fn run_one(
         "win_d_shot": win_d_shot_result,
         "input": input_result,
     }))
+}
+
+/// 每次 `ensure_band` 的累计统计。
+#[derive(Default)]
+struct CycleStats {
+    checks: u64,
+    corrected: u64,
+    lost: u64,
+    needs_restart: bool,
+    worst: Option<BandState>,
+}
+
+impl CycleStats {
+    fn record(&mut self, state: BandState) {
+        self.checks += 1;
+        match state {
+            BandState::Correct => {}
+            BandState::Corrected => self.corrected += 1,
+            BandState::Lost => {
+                self.lost += 1;
+                // 与 wp-host 的退出码 75 同义：进程内无解，只能重启渲染进程。
+                self.needs_restart = true;
+            }
+        }
+        self.worst = Some(match (self.worst, state) {
+            (_, BandState::Lost) | (Some(BandState::Lost), _) => BandState::Lost,
+            (_, BandState::Corrected) | (Some(BandState::Corrected), _) => BandState::Corrected,
+            _ => BandState::Correct,
+        });
+    }
+}
+
+/// 等待一段时间，期间保持消息泵与 DComp 绘制运行。
+fn pump_for(surface: &mut Option<wp_platform::DcompSurface>, settle: Duration) {
+    let deadline = Instant::now() + settle;
+    while Instant::now() < deadline {
+        wp_platform::pump_messages();
+        if let Some(s) = surface.as_mut() {
+            let _ = s.clear(wp_platform::TEST_RGB);
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
+/// 核对一次层级并累计统计。
+fn check_band(
+    host: &mut dyn wp_platform::DesktopHost,
+    hwnd: isize,
+    stats: &mut CycleStats,
+) -> Result<BandState> {
+    let state = host.ensure_band(hwnd).map_err(|e| anyhow::anyhow!("{e}"))?;
+    stats.record(state);
+    Ok(state)
+}
+
+/// `wpctl cycles`：反复「最小化所有窗口 → 还原」，每次切换后核对层级。
+///
+/// M0 验收第 3 条要求「10 分钟 + 最小化/还原 20 次后层级仍正确」。最小化会让桌面
+/// 露出来，`Progman` / `DefView` 的激活状态随之变化，是最容易把 z 序改乱的操作之一，
+/// 因此单独压测：每次切换后都调用 `ensure_band`，统计修正与丢失次数。
+fn run_cycles(
+    count: u32,
+    strategy_name: &str,
+    content: &str,
+    monitor_idx: usize,
+    settle_ms: u64,
+    shot: Option<&Path>,
+    as_json: bool,
+) -> Result<()> {
+    let monitors = wp_platform::enumerate_monitors();
+    let monitor = monitors
+        .get(monitor_idx)
+        .with_context(|| {
+            format!(
+                "显示器索引 {monitor_idx} 不存在（共 {} 台）",
+                monitors.len()
+            )
+        })?
+        .clone();
+
+    let strategy = strategy_name
+        .parse::<Strategy>()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut host = strategy.open()?;
+
+    let spec = match strategy {
+        Strategy::DefViewChild => {
+            let parent =
+                wp_platform::defview_handle().context("找不到图标层，策略 F 无法创建子窗口")?;
+            wp_platform::HostWindowSpec::child_of(parent, monitor.rect)
+        }
+        _ => wp_platform::HostWindowSpec::for_monitor(monitor.rect),
+    }
+    .with_noredirection_bitmap(content == "d3d");
+    let hwnd = wp_platform::create_host_window(&spec).context("创建宿主窗口失败")?;
+
+    if let Err(e) = host.attach(hwnd, monitor.rect) {
+        wp_platform::destroy_host_window(hwnd);
+        return Err(anyhow::anyhow!("attach 失败: {e}"));
+    }
+
+    let topmost = !matches!(strategy, Strategy::DefViewAdopt | Strategy::DefViewChild);
+    let mut surface = if content == "d3d" {
+        make_surface(strategy_name, hwnd, monitor.rect, topmost)
+    } else {
+        None
+    };
+
+    let settle = Duration::from_millis(settle_ms.max(100));
+    let mut stats = CycleStats::default();
+    let mut rounds = Vec::new();
+
+    for round in 0..count {
+        // 1) 最小化所有普通窗口，把桌面亮出来。
+        let handles = wp_platform::minimize_other_windows();
+        pump_for(&mut surface, settle);
+        // 记录「修正前」的图标层状态：最小化会让 Explorer 自己动窗口树，
+        // 这里要分清是父窗口被抢走，还是只是被隐藏。
+        let state_after_minimize = wp_platform::defview_state();
+        let z_after_minimize = z_band_report(hwnd);
+        let hidden = check_band(&mut *host, hwnd, &mut stats)?;
+
+        // 2) 还原，模拟用户切回应用。
+        wp_platform::restore_windows(&handles);
+        pump_for(&mut surface, settle);
+        let state_after_restore = wp_platform::defview_state();
+        let shown = check_band(&mut *host, hwnd, &mut stats)?;
+
+        rounds.push(json!({
+            "round": round + 1,
+            "hidden_windows": handles.len(),
+            "band_after_minimize": band_name(hidden),
+            "band_after_restore": band_name(shown),
+            "defview_after_minimize": state_after_minimize,
+            "defview_after_restore": state_after_restore,
+            "z_after_minimize": z_after_minimize,
+        }));
+
+        if stats.needs_restart {
+            eprintln!("[cycles] 第 {} 轮层级丢失（Lost），停止压测", round + 1);
+            break;
+        }
+    }
+
+    // 截图前先最小化、再核对层级：这样截到的是「看门狗修正之后」的真实画面，
+    // 而不是过渡状态。同时把修正前后的 z 链一起记下来，方便定位是谁盖住了壁纸。
+    let mut shot_result = None;
+    if let Some(path) = shot {
+        let handles = wp_platform::minimize_other_windows();
+        pump_for(&mut surface, settle);
+        let z_before = z_band_report(hwnd);
+        // 先量一次「修正前」的可见性，再修正、再量一次：用来判断层级漂移到底
+        // 会不会让壁纸被盖住，还是只是无害的 z 序错位。
+        let before_shot = wp_platform::capture(monitor.rect)?;
+        let ratio_before = before_shot.ratio_of(wp_platform::TEST_RGB);
+        let state = check_band(&mut *host, hwnd, &mut stats)?;
+        pump_for(&mut surface, Duration::from_millis(200));
+        let image = wp_platform::capture(monitor.rect)?;
+        wp_platform::save_bmp(path, &image)
+            .with_context(|| format!("保存 {} 失败", path.display()))?;
+        let ratio = image.ratio_of(wp_platform::TEST_RGB);
+        let z_after = z_band_report(hwnd);
+        wp_platform::restore_windows(&handles);
+        eprintln!(
+            "截图 {}：修正前 {:.1}% → 修正后 {:.1}%（层级 {}）",
+            path.display(),
+            ratio_before * 100.0,
+            ratio * 100.0,
+            band_name(state)
+        );
+        shot_result = Some(json!({
+            "path": path,
+            "band_before_shot": band_name(state),
+            "wallpaper_ratio_before_fix": ratio_before,
+            "wallpaper_ratio": ratio,
+            "z_before": z_before,
+            "z_after": z_after,
+        }));
+    }
+
+    drop(surface);
+    let _ = host.detach(hwnd);
+    wp_platform::destroy_host_window(hwnd);
+
+    let passed = stats.lost == 0 && !stats.needs_restart;
+    let summary = json!({
+        "strategy": strategy_name,
+        "content": content,
+        "requested": count,
+        "cycles": rounds.len(),
+        "checks": stats.checks,
+        "corrected": stats.corrected,
+        "lost": stats.lost,
+        "worst_band": stats.worst.map(band_name),
+        "passed": passed,
+        "shot": shot_result,
+        "rounds": rounds,
+    });
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "策略 {strategy_name}（{content}）：{} 轮 / 检查 {} 次 / 修正 {} 次 / 丢失 {} 次，最差层级 {}",
+            rounds.len(),
+            stats.checks,
+            stats.corrected,
+            stats.lost,
+            stats.worst.map(band_name).unwrap_or("-")
+        );
+        println!("结论: {}", if passed { "通过" } else { "未通过" });
+    }
+    Ok(())
 }
 
 fn take_shot(name: &str, path: &Path, rect: PhysicalRect, minimize: bool) -> Result<Value> {
