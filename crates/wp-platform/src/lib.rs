@@ -9,6 +9,7 @@ pub mod input;
 pub mod monitor;
 pub mod pause;
 pub mod session;
+pub mod single_instance;
 pub mod window;
 
 pub use capture::{capture, save_bmp, ScreenImage};
@@ -26,12 +27,13 @@ pub use pause::{
     decide, sample, ForegroundWindow, PauseFlags, PauseInputs, PauseReason, PauseReport,
 };
 pub use session::current_session_id;
+pub use single_instance::SingleInstance;
 pub use window::{
-    activate_window, class_at_point, close_host_windows, create_host_window, create_probe_window,
-    describe, destroy_host_window, host_windows, host_windows_on, is_host_window_alive,
-    is_minimized, minimize_other_windows, move_host_window, paint_solid, pump_messages,
-    restore_leaked_windows, restore_window, restore_windows, HostWindowSpec, PROBE_WINDOW_CLASS,
-    TEST_COLOR, TEST_RGB, WINDOW_CLASS,
+    activate_window, class_at_point, close_host_windows, close_host_windows_on, create_host_window,
+    create_probe_window, describe, destroy_host_window, host_windows, host_windows_on,
+    is_host_window_alive, is_minimized, minimize_other_windows, move_host_window, paint_solid,
+    pump_messages, restore_leaked_windows, restore_window, restore_windows, HostWindowSpec,
+    PROBE_WINDOW_CLASS, TEST_COLOR, TEST_RGB, WINDOW_CLASS,
 };
 
 /// 桌面宿主窗口的推荐扩展样式。

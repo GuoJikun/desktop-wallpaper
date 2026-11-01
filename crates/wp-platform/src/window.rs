@@ -262,12 +262,23 @@ unsafe extern "system" fn collect_host_window(hwnd: HWND, lparam: LPARAM) -> BOO
 /// 硬杀会把用户桌面图标层一起销毁（见 AGENTS.md 硬规则 3 第五条）。
 pub fn close_host_windows() -> usize {
     let windows = host_windows();
-    for &hwnd in &windows {
+    close_windows(&windows);
+    windows.len()
+}
+
+/// 只关掉指定显示器上的宿主窗口，返回发送数量。
+pub fn close_host_windows_on(rect: PhysicalRect) -> usize {
+    let windows = host_windows_matching(rect);
+    close_windows(&windows);
+    windows.len()
+}
+
+fn close_windows(windows: &[isize]) {
+    for &hwnd in windows {
         unsafe {
             let _ = PostMessageW(Some(raw(hwnd)), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
-    windows.len()
 }
 
 /// 有多少个宿主窗口落在指定显示器矩形内。
@@ -276,6 +287,10 @@ pub fn close_host_windows() -> usize {
 /// 后者只是说明这台机器上还有别处的渲染进程。宿主窗口永远与显示器左上角对齐，
 /// 所以比较原点即可。
 pub fn host_windows_on(rect: PhysicalRect) -> usize {
+    host_windows_matching(rect).len()
+}
+
+fn host_windows_matching(rect: PhysicalRect) -> Vec<isize> {
     host_windows()
         .into_iter()
         .filter(|&hwnd| {
@@ -283,7 +298,7 @@ pub fn host_windows_on(rect: PhysicalRect) -> usize {
             let ok = unsafe { GetWindowRect(raw(hwnd), &mut r) }.is_ok();
             ok && r.left == rect.x && r.top == rect.y
         })
-        .count()
+        .collect()
 }
 
 /// 窗口是否处于最小化状态。
