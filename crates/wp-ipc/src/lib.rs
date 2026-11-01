@@ -1,11 +1,17 @@
 //! 主进程 ↔ 渲染进程的管道协议。
 //!
 //! 帧格式：`u32 LE 长度` + MessagePack 负载。
+//! 管道读写见 [`pipe`]：那层只负责拿到一个可读写的 `File`，
+//! 帧编解码始终走本文件，这样管道和内存缓冲共用同一份协议测试。
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use wp_core::{PhysicalRect, PropertyValues, WallpaperId, WallpaperSpec};
+
+#[cfg(windows)]
+pub mod pipe;
 
 /// 单帧上限，防止异常输入把内存撑爆。
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -29,6 +35,7 @@ pub enum ErrorCode {
     Decode,
     NotFound,
     Permission,
+    Unsupported,
     Internal,
 }
 
@@ -38,6 +45,13 @@ pub enum Command {
     Load {
         item: WallpaperId,
         spec: WallpaperSpec,
+    },
+    /// 直接加载一个本地文件，不走壁纸库。
+    ///
+    /// M1 的 `wpctl attach` 用它换图：宿主已经在跑，只需要换内容，
+    /// 没必要为一张图重建进程和桌面挂载。
+    LoadFile {
+        path: PathBuf,
     },
     Unload,
     Pause {
@@ -65,7 +79,15 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "evt", rename_all = "snake_case")]
 pub enum Event {
-    Ready { backend: String },
+    Ready {
+        backend: String,
+    },
+    /// `Command::LoadFile` 成功，回传实际解码后的尺寸。
+    Loaded {
+        path: String,
+        width: u32,
+        height: u32,
+    },
     Stats {
         fps: f32,
         cpu: f32,
@@ -172,6 +194,20 @@ mod tests {
     }
 
     #[test]
+    fn load_file_roundtrip() {
+        let msg = Command::LoadFile {
+            path: PathBuf::from(r"E:\wallpapers\a.png"),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+        let back: Command = read_frame(&mut Cursor::new(buf)).unwrap();
+        match back {
+            Command::LoadFile { path } => assert_eq!(path, PathBuf::from(r"E:\wallpapers\a.png")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_oversized_frame_header() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&((MAX_FRAME + 1) as u32).to_le_bytes());
@@ -181,9 +217,6 @@ mod tests {
 
     #[test]
     fn pipe_name_shape() {
-        assert_eq!(
-            pipe_name(1, 2),
-            r"\\.\pipe\wallpaper-host-1-2"
-        );
+        assert_eq!(pipe_name(1, 2), r"\\.\pipe\wallpaper-host-1-2");
     }
 }
