@@ -16,9 +16,11 @@
 3. **策略 E 的三条铁律**：① DComp `CreateTargetForHwnd` 的 `topmost` 必须为 `false`；
    ② 销毁宿主窗口前必须先把 DefView 还给 `Progman`；③ 进程启动先跑 `heal_desktop()`。
    违反任一条 → 图标消失、盖住图标或被 `DestroyWindow` 一起带走。
-   **第四条：Explorer 重启后必须重启 `wp-host` 进程。** 新 `SHELLDLL_DefView` 不透明，
-   进程内重建窗口实测仍是黑屏（0%），只有重启进程能恢复（94.6%）。
-   所以 `ensure_band() == Lost` 的含义是「请 supervisor 重启本进程」，不要原地重试。
+   **第四条：Explorer 重启后必须重启 `wp-host` 进程，但重启也未必救得回来。** 新
+   `SHELLDLL_DefView` 是不透明的，进程内重建窗口实测仍是黑屏，所以
+   `ensure_band() == Lost` 的含义是「请 supervisor 重启本进程」，不要原地重试。
+   重启后若壁纸仍被整块盖住（像素自检连续两次判否），宿主必须退出 **77** 退回系统壁纸：
+   进程内换父窗口自救、重建窗口、等待自愈都已实测无效（见 `docs/implementation.md` §4.5）。
    **第五条：重启必须是优雅退出。** 先 `detach` 把 `DefView` 还给 `Progman`，再退出进程。
    禁止 `Stop-Process` / `TerminateProcess` 硬杀：`DefView` 是我们窗口的子窗口，
    Windows 会连它一起销毁 → 桌面图标层消失、任务栏与 `Alt+Tab` 错乱（实测，只能重启 Explorer 恢复）。
@@ -31,7 +33,8 @@
 6. **不要让壁纸窗口吃掉桌面输入。** 除 `WS_EX_TRANSPARENT` 外，必须实现 `WM_NCHITTEST → HTTRANSPARENT`。
 7. **M1 之前不写任何编辑器代码。** 范围蔓延的最大来源。
 8. **壁纸渲染不能在主进程里做。** 每显示器一个独立 `wp-host` 进程。
-9. **挂不上桌面时退回静态壁纸并提示，绝不黑屏。**
+9. **挂不上桌面时退回静态壁纸并提示，绝不黑屏。** 判据是像素（`wp-host` 每 5 s 抽查一次），
+   命中即走退出码 **77**，由 supervisor 保留系统壁纸、不自动重试。
 10. **完成一个小功能就立刻提交一次，不要攒一批改动。** 提交信息必须遵循 Angular 规范，
    且**全部使用中文**：
    `<type>(<scope>): <中文描述>`，type 取
@@ -65,6 +68,11 @@
   一次 `UpdateSubresource` 上屏，`wp-host --image`，`wpctl attach|stop`（见 `docs/implementation.md` §4.4）。
 - **M1 IPC 换图**：`wp-ipc` 命名管道（`Command::LoadFile` / `Event::Loaded`），
   `wpctl attach` 复用运行中的宿主换图，不重启进程（`--no-ipc` 可关）。
+- **M1 监督进程**：`wp-supervisor` 每屏一个 worker（单实例互斥量 + 控制管道
+  `\\.\pipe\wallpaper-supervisor-{session}`），按退出码重启；`wpctl attach|stop` 优先走它。
+- **M1 黑屏兜底**：Explorer 重启后壁纸可能被不透明图标层整块盖住且无法恢复，
+  宿主像素自检连续两次判否即退出 **77**，桌面回到系统壁纸，绝不黑屏
+  （见 `docs/implementation.md` §4.5）。
 
 ### 最高风险（M0 收尾要解决）
 挂载机制已确定，剩下的是**边界条件**而不是可行性：
@@ -72,7 +80,7 @@
 | 场景 | 现状 |
 |---|---|
 | 多显示器 / 混合 DPI | 单屏环境，未验证 |
-| Explorer 重启 | **已实测**：进程内无解，须重启 `wp-host`（watchdog 报 `Lost`，端到端验证通过） |
+| Explorer 重启 | **已实测**：进程内无解，须重启 `wp-host`；重启后新的不透明图标层仍可能盖住壁纸 → 2.6 s 内退出 77 退回系统壁纸（§4.5） |
 | `Win+D` | **已实测**：显示桌面会把 `Progman` 抬到宿主之上；改成把 `Progman` 压回底部后壁纸稳定（94.3%–99.0%，3 轮） |
 | 锁屏解锁、RDP 重连、休眠唤醒 | 锁屏解锁**已实测 2 轮**（暂停/恢复、无 Lost）；RDP 与休眠未验证 |
 | 崩溃后桌面自愈 | **已实测**：硬杀会连 `DefView` 一起销毁 → 下次启动按崩溃记录自动重启 Explorer 恢复 |
@@ -98,7 +106,8 @@ wallpaper.exe            Tauri 应用：UI / 库管理 / 配置 / 调度 / IPC �
        └─ ...
 ```
 
-- IPC：命名管道 `\\.\pipe\wallpaper-host-{id}`，长度前缀 + serde 消息
+- IPC：命名管道（宿主管道 `\\.\pipe\wallpaper-host-{session}-{monitor}`、supervisor 控制管道
+  `\\.\pipe\wallpaper-supervisor-{session}`），长度前缀 + serde 消息
 - 主进程不渲染壁纸；Tauri WebView 只做 UI 与预览缩略图
 
 ### 3.2 目录约定
@@ -211,6 +220,12 @@ cargo run -p wpctl -- attach --monitor 0 --source out\wp-test-quadrant.png
 cargo run -p wpctl -- attach --monitor 0 --source <png|jpg|bmp> --no-pause   # 调试：不因前台全屏暂停
 # 宿主已在跑时，上面这条 attach 走 IPC 直接换图（不重启进程）；`--no-ipc` 可关掉管道
 cargo run -p wpctl -- stop
+# 看 supervisor / 宿主日志（中文，必须指定 UTF8）
+Get-Content -Encoding UTF8 "$env:TEMP\wallpaper-supervisor.log" -Tail 20
+Get-Content -Encoding UTF8 "$env:TEMP\wallpaper-host-0.log" -Tail 20
+# Explorer 重启后壁纸被图标层盖住（宿主退出 77、桌面回到系统壁纸）时，
+# 用独立进程跑一次 probe 能把 DefView 拉回正常状态，之后再 attach 即可
+cargo run -p wpctl -- probe --strategy defview_adopt --content d3d --duration 3
 cargo tauri dev   # 在 apps/desktop 下
 ```
 

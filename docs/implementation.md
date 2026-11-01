@@ -170,7 +170,7 @@ wpctl probe --strategy all --content gdi,d3d --duration 30 --report out/report.j
 5. 视频后端：外部 mpv 进程（**等许可证定稿**）
 6. Tauri UI：库 + 预览 + 托盘
 7. ✅ 暂停规则（全屏/锁屏/电池，M0 期间完成）
-8. 自启、单实例、崩溃重启（`wp-supervisor`）
+8. ✅ 单实例、崩溃重启（`wp-supervisor`）；自启待做
 
 > 顺序原则：**先打通"进程 → 窗口 → 像素"，再做 UI**。UI 是最后一块。
 
@@ -207,6 +207,51 @@ wpctl probe --strategy all --content gdi,d3d --duration 30 --report out/report.j
   这是正确行为，调试时加 `--no-pause`。
 - `wpctl attach` 拉起的 `wp-host` 与调用者同一控制台进程组：Ctrl+C 会走优雅退出；
   显式停止用 `wpctl stop`（发 `WM_CLOSE`，禁止硬杀）。
+
+### 4.5 已完成：监督进程与 Explorer 重启兜底（2026-11-01）
+
+| 项 | 实现 |
+|---|---|
+| supervisor | `crates/wp-supervisor`：每屏一个 worker 线程，按退出码决定重启 / 停止 |
+| 单实例 | 命名互斥量 `Local\wallpaper-supervisor-{session}`，第二个实例直接退出 |
+| 控制管道 | `\\.\pipe\wallpaper-supervisor-{session}`：`LoadFile` / `Shutdown`，`wpctl attach|stop` 优先走它 |
+| 换图 | supervisor 找到该屏 worker 后转成宿主管道的 `LoadFile`，进程不重启 |
+| 优雅退出 | 只走 IPC `Shutdown` → `WM_CLOSE` → `detach` → 结束进程，禁止硬杀 |
+| 壳层闸门 | Explorer 重启后先等 `shell_ready()`（新 `SysListView32` 建好）再拉起宿主，最多等 20 s |
+| 黑屏兜底 | 宿主覆盖自检（像素）连续两次判定被盖住 → 退出码 77 → 保留系统壁纸，不自动重启 |
+| 用户提示 | `wpctl attach` 采样屏幕，整屏纯色时提示「看不见壁纸」，指向本文档 |
+
+退出码约定：`0` 正常、`1`/其它 退避重启、`75` 换壳层快速重启、`76` 显示器移除、`77` 被盖住。
+
+**Explorer 重启的实测结论（重要）**：重启后进程内**无法**恢复成我们的画面。
+
+| 现象 | 证据 |
+|---|---|
+| 新 `SHELLDLL_DefView` 自己画一层不透明背景 | 黑屏时把 `DefView` 缩到 400×300，壁纸立刻露出 94.5% |
+| 窗口树 / 样式 / z 带与正常时完全一致 | `GetParent(defview) == host`，style 都是 `0x56010000` / ex `0x00080000` |
+| 与 DComp 无关 | 用 `--content gdi` 的 probe 同样被盖住 |
+| 进程内自救无效 | 复刻 probe 的换父窗口动作，最好只到「Explorer 自己画壁纸」；重建窗口仍是黑 |
+| 时间也不会自愈 | 60 s 内每 10–15 s 采样，一直是黑 |
+| 只有 `DefView` 回到正常状态后才恢复 | 跑一次 `wpctl probe --strategy defview_adopt`（独立进程、干净退出）后壁纸恢复 |
+
+产品策略：既然修不回来，就不留黑屏——宿主 2 s 出头就退出 77，桌面回到系统壁纸，
+supervisor 不再重启，下次用户换图时再试。
+
+实测（单屏 1920×1080）：
+
+| 用例 | 结果 |
+|---|---|
+| 健康桌面 30 s | 自检全部「可见」，无一次误判 |
+| `Stop-Process explorer -Force` | 宿主退出 75 → 0.3 s 后重启 → 2.6 s 判定被盖住 → 退出 77 → 桌面回系统壁纸 `RGB(100,146,207)`，supervisor 不重启 |
+| 被盖住时 `wpctl attach` | 打印「警告：屏幕上看不到壁纸…」 |
+| `wpctl attach` 换图（健康） | pid 不变，平均色变为新图 |
+| `wpctl stop` | 优雅退出，图标 / 任务栏正常 |
+
+已知限制：
+
+- 覆盖自检靠像素，纯色壁纸（整幅一个颜色）会被误判成「被盖住」——与「黑屏」在像素上无法区分。
+- 被盖住后不会自动重试；要恢复只有两种办法：用户换一次图，或重启 Explorer 让
+  `DefView` 回到正常状态。
 
 ---
 
@@ -312,6 +357,7 @@ wpctl probe --strategy all --content gdi,d3d --duration 30 --report out/report.j
 | R6 | 多屏 DPI 兼容 | 中 | 中 | MonitorKey + DPI 感知统一 | M2 |
 | R7 | 范围蔓延（编辑器） | 高 | 高 | 硬规则：M1 前不写 | 每次评审 |
 | R8 | 反作弊误判 | 低 | 高 | 不注入、不 overlay | M3 |
+| R9 | Explorer 重启后壁纸无法恢复（26H2 图标层不透明） | 已发生 | 中 | 退出 77 退回系统壁纸 + 提示，下次换图再试 | 已定稿 |
 
 ---
 
@@ -332,8 +378,10 @@ wpctl probe --strategy all --content gdi,d3d --duration 30 --report out/report.j
 
 ## 13. 下一步动作
 
-1. 建 workspace 与空 crate，跑通 `cargo check`
-2. 实现 `wp-platform::window` + `strategy_b`（26H2 已验证可显示，先拿到能跑的基线）
-3. 加 D3D11 清屏内容，重复实验观察是否比 GDI 稳定
-4. 实现 `watchdog::ensure_band`，验证能否把漂移收敛
-5. 补 A/C 策略，跑完矩阵，写 ADR
+1. 视频后端许可证定稿（mpv GPL / FFmpeg LGPL / 暂缓），决定后立刻开工
+2. Tauri UI：壁纸库 + 预览缩略图 + 托盘，`attach` 改走 supervisor 管道
+3. 自启（注册表 Run 键）与 SQLite 配置落库
+4. 多屏 / 混合 DPI：需要虚拟显示器驱动或第二块屏才能验证
+5. RDP 重连、休眠唤醒的实机补测
+
+<i>(M0 阶段的建 workspace / 跑 probe 矩阵 / 写 ADR 均已完成，见 §3 与 `.opencode/plans/wallpaper-probe-26h2.md`。)</i>

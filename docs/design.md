@@ -163,7 +163,20 @@ pub trait DesktopHost: Send {
 
 判定方法（避免误判）：检查 `GetWindow(hwnd, GW_HWNDPREV)` 链条中，宿主层级标志窗口（`Progman` / `SHELLDLL_DefView` / 指定 anchor）与自身的前后关系是否与策略预期一致。
 
-> 不要用"像素采样"做健康检查：代价高且会被遮挡误判。
+> z 序核对是主判据，不要拿"像素采样"当常规健康检查：代价高且会被遮挡误判。
+
+**覆盖自检（像素，只用于兜底）**。z 序完全正确时画面仍可能被盖住：Explorer 重启后新建的
+`SHELLDLL_DefView` 会自己画一层不透明背景，窗口树、样式、z 带与正常时一模一样，只是我们的
+DComp 内容整块不显示（实测见 `wallpaper-probe-26h2.md` §7.14）。这种情况只能看像素：
+
+| 步骤 | 结论 |
+|---|---|
+| 采样点（屏宽 30–90%、高 20–80% 的 20 个点，避开图标列与任务栏）能对上该画的像素 | 可见 |
+| 一个都对不上，但采样点颜色彼此不一致（屏幕「有内容」） | 被别的窗口盖着，算可见 |
+| 屏幕整块单一纯色，且没有一处是我们的像素 | 被 `DefView` 自己画的背景盖住 |
+
+命中第三条即宿主的退出码 77：进程内无解（换父窗口自救最多只能让 Explorer 自己画壁纸），
+由 supervisor 停止该屏并保留系统壁纸（硬规则 9），下次换图时再试。
 
 ### 3.6 窗口样式
 
@@ -351,7 +364,10 @@ LICENSE.txt
 
 ### 6.1 传输
 
-命名管道：`\\.\pipe\wallpaper-host-{session_id}-{monitor_index}`
+两个命名管道，帧格式相同：
+
+- 宿主管道（每屏一个）：`\\.\pipe\wallpaper-host-{session_id}-{monitor_index}`
+- supervisor 控制管道（整机一个）：`\\.\pipe\wallpaper-supervisor-{session_id}`
 
 帧格式：`u32 LE 长度` + msgpack 负载，单帧上限 8 MB（防止异常输入撑爆内存）。
 
@@ -387,12 +403,46 @@ M1 只实现「一问一答」：客户端发 `LoadFile`，宿主回 `Loaded` �
 `Ready` 握手和 `Stats` 心跳等 supervisor 落地时再加——那需要读超时或异步 IO，
 现在用同步阻塞的 `File` 读写最简单可靠。
 
+supervisor 控制管道（M1 已实现，`wp-ipc::supervisor`）：
+
+```rust
+pub enum Command {
+    /// 找该屏的 worker；没有就按自己的启动参数拉起一个，再走宿主管道换图。
+    LoadFile { monitor: u32, path: PathBuf },
+    /// 停掉所有 worker 并退出。worker 走 WM_CLOSE / 管道 Shutdown，不硬杀。
+    Shutdown,
+}
+
+pub enum Event {
+    Loaded { monitor: u32, path: String, width: u32, height: u32 },
+    Error { monitor: Option<u32>, code: ErrorCode, message: String },
+    /// 所有 worker 已退出，supervisor 正在收尾。
+    Stopped,
+}
+```
+
+界面只跟 supervisor 打交道，不需要知道哪块屏由哪个进程负责。
+
 ### 6.3 生命周期
 
-1. Supervisor spawn `wp-host --monitor N --token <random>`
-2. host 创建 HWND、attach 桌面、再开始监听管道（先挂好桌面才允许换图）
-3. host 发 `Ready`；超时 5 s 未就绪则杀掉重启
-4. 运行期心跳：host 每 2 s 发 `Stats`；30 s 无消息视为失联
+**现状（M1）**：
+
+1. supervisor 自己在单实例锁内启动（`Local\wallpaper-supervisor-{session}`），
+   按需为每块屏 spawn `wp-host --monitor N --strategy … --image …`；
+2. host 先建 HWND、`attach` 桌面，再开始监听宿主管道——挂好桌面才允许换图；
+3. 退出只有两条路：管道 `Shutdown` 或 `WM_CLOSE`，宿主先 `detach`（把 `DefView` 还给
+   `Progman`）再结束进程。**禁止硬杀**：图标层是宿主窗口的子窗口，会被一起销毁；
+4. supervisor 按退出码处理，见下表。
+
+| 退出码 | 含义 | supervisor 动作 |
+|---|---|---|
+| 0 | 正常退出（`Shutdown` / 到时） | 不重启 |
+| 1 / 其它 | 启动失败或运行时崩溃 | 退避重启（0.5 s 起翻倍，封顶 30 s；运行满 30 s 重置计数） |
+| 75 | `ensure_band() == Lost`（Explorer 换了桌面壳层） | 300 ms 后重启宿主；重启前先等 `shell_ready()` |
+| 76 | 目标显示器已移除 | 停止该屏，等热插拔 |
+| 77 | 壁纸被不透明的 `DefView` 整块盖住 | **不重启**，保留系统壁纸，下次换图再试 |
+
+**待补**：`Ready` 握手与 `Stats` 心跳（30 s 无消息判失联）、token 鉴权。
 
 ---
 
@@ -486,6 +536,7 @@ SQLite 开 WAL；迁移用版本号 + 顺序脚本（`PRAGMA user_version`）。
 | ADR-004 | 视频先用外部 mpv.exe | 规避 GPL 链接风险 | 多一个进程，M0 后复核 |
 | ADR-005 | 网页壁纸独立 WebView2 配置目录 | 安全隔离 | 磁盘占用增加 |
 | ADR-006 | 26H2 采用「反向接管 `SHELLDLL_DefView`」 | 分界线在 DefView，Progman 子窗口只能落一侧 | 必须 detach + 启动自愈，且 DComp visual 不得 topmost |
+| ADR-007 | Explorer 重启后若被不透明图标层盖住，退回系统壁纸而不是死磕恢复 | 进程内换父窗口 / 重建窗口 / 等待自愈实测全部无效，只有另一个进程干净接管一次才能翻转 | 新增退出码 77；supervisor 不自动重试；用户下次换图时再试 |
 
 ---
 
