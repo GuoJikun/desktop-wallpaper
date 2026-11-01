@@ -12,6 +12,7 @@ use wp_core::{PhysicalRect, PropertyValues, WallpaperId, WallpaperSpec};
 
 #[cfg(windows)]
 pub mod pipe;
+pub mod supervisor;
 
 /// 单帧上限，防止异常输入把内存撑爆。
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
