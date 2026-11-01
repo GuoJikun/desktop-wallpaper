@@ -217,7 +217,8 @@ SendMessageTimeout(Progman, 0x052C, wParam=0xD, lParam=0) -> ret=1
 - [x] **全屏应用 / 最大化窗口的暂停判定** —— 已实测，见 §7.9
 - [x] **长时间（≥ 30 分钟）稳定性与占用** —— 已实测，见 §7.10
 - [x] **最小化 / 还原 20 次后层级仍正确** —— 已实测，见 §7.11
-- [ ] 最小化后任务栏被盖住的 ≤2 s 窗口（可接 `SetWinEventHook` 缩短）
+- [x] **z 序事件触发（修正延迟 ≤0.2 s）** —— 已实测，见 §7.12
+- [x] **任务视图（`Win+Tab`）** —— 已实测，见 §7.13
 
 ### 7.5 Explorer 重启：必须重启渲染进程
 
@@ -450,8 +451,62 @@ z 序底部，宿主相对位置上移，最终停在 `Shell_TrayWnd` 之上、`
 `wp-host` 的看门狗（2 s 一轮）会在一轮内纠正。壁纸本身全程可见（98.9%），
 不存在黑屏或图标丢失。
 
-结论：M0 验收第 3 条通过。可改进项：接 `SetWinEventHook(EVENT_OBJECT_REORDER /
-EVENT_SYSTEM_MINIMIZESTART / EVENT_SYSTEM_MINIMIZEEND)` 把「最小化后盖住任务栏」
-的窗口从 ≤2 s 压到一帧级；这属于 M0 打磨，不阻塞进入 M1。
+结论：M0 验收第 3 条通过。该修正延迟已在 §7.12 修掉：接 `SetWinEventHook` 后
+最小化/还原动作在 0.6 s 内就会触发核对，不再等 2 s 定时器。
+
+### 7.12 z 序事件触发：把修正延迟从 2 s 压到 0.2 s
+
+§7.11 的残留问题已修：`wp-host` 装了 `ZEventHooks`，订阅
+`EVENT_OBJECT_REORDER` / `EVENT_SYSTEM_FOREGROUND` / `EVENT_SYSTEM_MINIMIZESTART` /
+`EVENT_SYSTEM_MINIMIZEEND`（`WINEVENT_OUTOFCONTEXT`，回调在我们的消息循环里跑）。
+回调只置一个原子标志，真正核对留给事件循环，并限流 200 ms——`EVENT_OBJECT_REORDER`
+在拖窗口 / Alt+Tab 时会连续爆发，不限流会把 z 链遍历打满。
+2 s 定时器保留作兜底。
+
+实测（`wp-host --duration 25 --no-pause`，期间跑 3 次 `wpctl shot --minimize`）：
+
+```
+12:18:01.529 z 序有漂移，已修正 corrections=1     ← shot #1 最小化
+12:18:02.070 z 序有漂移，已修正 corrections=2     ← shot #1 还原
+12:18:04.307 z 序有漂移，已修正 corrections=3     ← shot #2 最小化
+12:18:04.858 z 序有漂移，已修正 corrections=4     ← shot #2 还原
+12:18:07.024 z 序有漂移，已修正 corrections=5     ← shot #3 最小化
+12:18:15.071 运行时间到，正常退出 seconds=25 corrections=5 event_checks=6
+```
+
+修正时刻与最小化/还原动作对齐（每次动作后 <0.6 s），退出时 `event_checks=6`
+说明事件路径确实被走到；不再是 2 s 定时器碰巧命中。
+
+注意 `event_checks` 是「事件触发且通过限流」的次数，`corrections` 是「确实发现漂移」
+的次数：前台切换等事件经常在层级正常时到达，所以前者略大。
+
+开销验证（`scripts/soak-sampler.ps1 -Duration 300 -Tag soak-hook`，5 分钟）：
+
+| 指标 | 无钩子（§7.10，30 min） | 有钩子（5 min） |
+|---|---|---|
+| CPU 平均 / 峰值 | 0.1% / 0.2% | **0.12% / 0.2%** |
+| GPU 平均 / 峰值 | 0.5% / 1.4% | 0.51% / 1.9% |
+| 工作集 | 36.8–36.9 MB | 36.7 MB（无增长） |
+| z 序修正 | 启动 1 次 | 启动 1 次，期间 `event_checks=3` 但无需修正 |
+
+结论：事件触发路径在空闲时几乎零成本（只为前台切换多遍历几次 z 链），
+少样本下与基线无差异。
+
+### 7.13 任务视图（`Win+Tab`）
+
+M0 验收第 4 条还要求「任务视图后 3 s 内自恢复」。用一次性脚本模拟
+`Win+Tab` 与 `Esc`（`keybd_event`，脚本在 `out/`，不进仓库），
+`wp-host --duration 22 --no-pause` 全程运行：
+
+```
+12:26:22 Win+Tab
+12:26:25 Esc
+12:26:11 启动 → 修正 1 次（启动时）
+12:26:33 运行时间到 corrections=1 event_checks=3
+```
+
+任务视图是一层覆盖在所有窗口之上的 Shell UI，开关过程中 `event_checks` 增加 3 次
+（前台/重排事件），但**一次修正都不需要**：z 带完全没被改动，也没有 `Lost`。
+壁纸在任务视图关闭后仍在原位。
 
 

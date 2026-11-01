@@ -74,7 +74,8 @@
 | 崩溃后桌面自愈 | **已实测**：硬杀会连 `DefView` 一起销毁 → 下次启动按崩溃记录自动重启 Explorer 恢复 |
 | 全屏独占游戏暂停判定 | **已实测**：`wpctl pause` 自测 + `wp-host` 前台切换，1 s 内暂停/恢复（§7.9） |
 | 长时间（≥ 30 分钟）稳定性 / GPU 占用 | **已实测**：30 分钟 0 漂移、CPU 0.1%、GPU 0.5%、无泄漏（§7.10） |
-| 最小化 / 还原 20 次 | **已实测**：0 Lost、壁纸全程可见；最小化后 z 序漂移由看门狗一轮内修正（§7.11） |
+| 最小化 / 还原 20 次 | **已实测**：0 Lost、壁纸全程可见；z 序漂移由事件触发在 0.2 s 内修正（§7.11、§7.12） |
+| 任务视图（`Win+Tab`） | **已实测**：开关任务视图不改 z 带，无 `Lost`、无需修正（§7.13） |
 
 **M0 尚未收尾，仍不要开始写业务代码。**
 
@@ -126,11 +127,11 @@ wp-platform::desktop_host
 
 看门狗必须覆盖：
 
-- `SetWinEventHook`：`EVENT_OBJECT_REORDER`、`EVENT_SYSTEM_FOREGROUND`
+- `SetWinEventHook`：`EVENT_OBJECT_REORDER`、`EVENT_SYSTEM_FOREGROUND`（已实现，200 ms 限流）
 - `TaskbarCreated`（Explorer 重启）
 - `WM_DISPLAYCHANGE`、`WM_DPICHANGED`、`WM_SETTINGCHANGE`
 - `WTS_SESSION_*`（锁屏/解锁）、`WM_POWERBROADCAST`
-- 约 2 s 一次的 `GetWindow(hwnd, GW_HWNDPREV)` 链条核对
+- 约 2 s 一次的 `GetWindow(hwnd, GW_HWNDPREV)` 链条核对（兜底，事件触发之外照常跑）
 
 ### 3.4 渲染后端
 

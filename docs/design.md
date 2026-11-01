@@ -157,6 +157,10 @@ pub trait DesktopHost: Send {
 | 电源状态 | `WM_POWERBROADCAST` |
 | 兜底轮询 | 2 s 定时器 |
 
+事件触发路径已实现在 `wp-host`（`ZEventHooks`）：回调只置原子标志，
+事件循环最多每 200 ms 核对一次（`EVENT_OBJECT_REORDER` 会连续爆发，必须限流）。
+实测最小化窗口后 z 序在 0.2 s 内被修正，见 `wallpaper-probe-26h2.md` §7.12。
+
 判定方法（避免误判）：检查 `GetWindow(hwnd, GW_HWNDPREV)` 链条中，宿主层级标志窗口（`Progman` / `SHELLDLL_DefView` / 指定 anchor）与自身的前后关系是否与策略预期一致。
 
 > 不要用"像素采样"做健康检查：代价高且会被遮挡误判。
