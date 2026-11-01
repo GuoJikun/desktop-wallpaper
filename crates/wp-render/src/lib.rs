@@ -4,6 +4,10 @@
 //! - [`Renderer`]：由我们每帧驱动（图片、幻灯片、wgpu 场景）
 //! - [`Presenter`]：由外部组件自渲染，我们只控制（mpv、WebView2）
 
+pub mod image_backend;
+
+pub use image_backend::{decode, decode_file, BgraImage};
+
 use wp_core::WallpaperSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

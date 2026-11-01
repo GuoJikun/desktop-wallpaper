@@ -30,6 +30,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive"] }
+# 只开 PNG / JPEG / BMP 三个解码器：M1 图片壁纸够用，依赖体积也小。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 windows = "0.62"
 
 [profile.dev]
