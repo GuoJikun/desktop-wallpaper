@@ -1,5 +1,6 @@
 //! wpctl：不开 UI 也能探测桌面结构、跑挂载矩阵、截图验证、查看状态。
 
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -74,15 +75,29 @@ enum Cmd {
         #[arg(long)]
         minimize: bool,
     },
-    /// 挂载一张壁纸到指定显示器（M0 第 3 步后可用）
+    /// 把图片壁纸挂到指定显示器（拉起一个 wp-host 子进程）
     Attach {
         /// 显示器索引（0 起）
         #[arg(long, default_value_t = 0)]
         monitor: usize,
-        /// 媒体文件或壁纸包路径
+        /// 媒体文件路径（M1 只支持 PNG / JPEG / BMP）
         #[arg(long)]
         source: PathBuf,
+        /// 桌面宿主策略
+        #[arg(long, default_value = "defview_adopt")]
+        strategy: String,
+        /// 运行秒数，0 表示一直跑到 `wpctl stop`
+        #[arg(long, default_value_t = 0)]
+        duration: u64,
+        /// 调试用：不因前台全屏 / 最大化窗口暂停渲染
+        #[arg(long)]
+        no_pause: bool,
+        /// 拉起后立即返回，不确认宿主窗口是否出来
+        #[arg(long)]
+        no_wait: bool,
     },
+    /// 优雅停止所有壁纸渲染进程（发 WM_CLOSE，不硬杀）
+    Stop,
     /// 查看暂停判定结果（全屏应用 / 最大化遮挡 / 电池 / 远程会话）
     Pause {
         /// 以 JSON 输出
@@ -200,19 +215,15 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
-        Cmd::Attach { monitor, source } => {
-            let monitors = wp_platform::enumerate_monitors();
-            let info = monitors.get(monitor).with_context(|| {
-                format!("显示器索引 {monitor} 不存在（共 {} 台）", monitors.len())
-            })?;
-            bail!(
-                "attach 尚未实现（M0 第 3 步）。目标显示器: {} {}x{}，源: {}",
-                info.device,
-                info.rect.width,
-                info.rect.height,
-                source.display()
-            );
-        }
+        Cmd::Attach {
+            monitor,
+            source,
+            strategy,
+            duration,
+            no_pause,
+            no_wait,
+        } => attach(monitor, &source, &strategy, duration, no_pause, no_wait),
+        Cmd::Stop => stop_hosts(),
         Cmd::Pause {
             json,
             monitor,
@@ -301,6 +312,186 @@ fn probe(
     Ok(())
 }
 
+/// M1 支持的图片扩展名。URL / 壁纸包留到 M2。
+const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "bmp"];
+
+/// `wpctl attach`：拉起一个 `wp-host` 子进程把图片挂到指定显示器。
+///
+/// 选择「子进程」而不是进程内挂载，是因为渲染必须与 UI / 调试工具隔离：
+/// 每块屏一个 `wp-host`，崩溃只影响那一块屏（AGENTS.md 硬规则 8）。
+fn attach(
+    monitor_idx: usize,
+    source: &Path,
+    strategy: &str,
+    duration: u64,
+    no_pause: bool,
+    no_wait: bool,
+) -> Result<()> {
+    let monitors = wp_platform::enumerate_monitors();
+    let monitor = monitors
+        .get(monitor_idx)
+        .with_context(|| {
+            format!(
+                "显示器索引 {monitor_idx} 不存在（共 {} 台）",
+                monitors.len()
+            )
+        })?
+        .clone();
+
+    // 规范化成绝对路径：wp-host 的工作目录不一定和 wpctl 一样。
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("壁纸文件不存在: {}", source.display()))?;
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+        bail!(
+            "M1 只支持图片壁纸（{}），收到 .{ext}",
+            IMAGE_EXTENSIONS.join(" / ")
+        );
+    }
+
+    let exe = host_exe()?;
+    let before = wp_platform::host_windows().len();
+    if before > 0 {
+        eprintln!("[attach] 已经有 {before} 个宿主窗口在运行，先挂的会被新窗口盖住");
+    }
+
+    // 日志落文件而不是继承控制台：wp-host 是常驻进程，继承了控制台的管道会让
+    // 调用方一直等 EOF 才能返回；文件还能在出问题时回看。
+    let log = host_log_path(monitor_idx);
+    // 共享读写：宿主在跑的时候也能 tail 日志。
+    let log_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(0x7)
+        .open(&log)
+        .with_context(|| format!("创建日志 {} 失败", log.display()))?;
+    let log_err = log_file.try_clone()?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--monitor")
+        .arg(monitor_idx.to_string())
+        .arg("--strategy")
+        .arg(strategy)
+        .arg("--image")
+        .arg(&source)
+        .arg("--duration")
+        .arg(duration.to_string());
+    if no_pause {
+        cmd.arg("--no-pause");
+    }
+
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_err))
+        .spawn()
+        .with_context(|| format!("启动 {} 失败", exe.display()))?;
+    let pid = child.id();
+
+    if no_wait {
+        println!("已拉起 wp-host（pid {pid}），日志 {}", log.display());
+        return Ok(());
+    }
+
+    // 等宿主窗口真的出现：wp-host 启动失败（图片损坏、D3D 不可用）时
+    // 会立刻退出，这里要把退出码和日志尾部报给用户，而不是假装成功。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let tail = log_tail(&log, 12);
+            bail!(
+                "wp-host 启动后立即退出（{status}），日志 {}：\n{tail}",
+                log.display()
+            );
+        }
+        if wp_platform::host_windows().len() > before {
+            // 窗口出现只是第一步：解码失败或表面初始化失败会让进程在窗口出来之后
+            // 立刻退出。稍等一拍再确认它还活着，避免报「成功」之后图标层没人管。
+            std::thread::sleep(Duration::from_millis(400));
+            if let Some(status) = child.try_wait()? {
+                let tail = log_tail(&log, 12);
+                bail!(
+                    "wp-host 起来后又退出（{status}），日志 {}：\n{tail}",
+                    log.display()
+                );
+            }
+            println!(
+                "已挂载 {} → 显示器 [{monitor_idx}] {} {}x{}，wp-host pid {pid}",
+                source.display(),
+                monitor.device,
+                monitor.rect.width,
+                monitor.rect.height
+            );
+            println!("日志 {}；用 `wpctl stop` 优雅停止", log.display());
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "5 秒内没看到宿主窗口；wp-host（pid {pid}）仍在运行，日志 {}",
+                log.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 每个显示器一份日志，重复 attach 会覆盖（只留最近一次）。
+fn host_log_path(monitor_idx: usize) -> PathBuf {
+    std::env::temp_dir().join(format!("wallpaper-host-{monitor_idx}.log"))
+}
+
+/// 取日志最后几行，只在启动失败时用来解释原因。
+fn log_tail(path: &Path, lines: usize) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return "(日志读不出来)".into();
+    };
+    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = all.len().saturating_sub(lines);
+    if start == all.len() {
+        return "(日志为空)".into();
+    }
+    all[start..].join("\n")
+}
+
+/// `wpctl stop`：给所有宿主窗口发 `WM_CLOSE`，等它们自己把桌面还回去。
+fn stop_hosts() -> Result<()> {
+    let count = wp_platform::close_host_windows();
+    if count == 0 {
+        println!("没有正在运行的壁纸宿主");
+        return Ok(());
+    }
+    println!("已向 {count} 个宿主窗口发送 WM_CLOSE，等待退出…");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let left = wp_platform::host_windows().len();
+        if left == 0 {
+            println!("全部退出，桌面已还原");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let left = wp_platform::host_windows().len();
+    bail!("{left} 个宿主窗口 5 秒内没有退出；请查看 wp-host 日志，不要用 Stop-Process 硬杀");
+}
+
+/// `wp-host.exe` 与本工具同目录（都是 cargo 产物）。找不到时给出可操作的提示。
+fn host_exe() -> Result<PathBuf> {
+    let me = std::env::current_exe().context("无法定位 wpctl 自身路径")?;
+    let dir = me.parent().context("无法定位 wpctl 所在目录")?;
+    let exe = dir.join("wp-host.exe");
+    if !exe.is_file() {
+        bail!("找不到 {}，先运行 `cargo build -p wp-host`", exe.display());
+    }
+    Ok(exe)
+}
+
 fn shot_once(out: &Path, monitor_idx: usize, minimize: bool) -> Result<()> {
     let monitors = wp_platform::enumerate_monitors();
     let monitor = monitors.get(monitor_idx).with_context(|| {
@@ -323,14 +514,20 @@ fn shot_once(out: &Path, monitor_idx: usize, minimize: bool) -> Result<()> {
     wp_platform::save_bmp(out, &image).with_context(|| format!("保存 {} 失败", out.display()))?;
 
     let ratio = image.ratio_of(wp_platform::TEST_RGB);
+    let mean = image.mean_rgb();
+    let non_black = image.non_black_ratio();
     guard.release();
 
     println!(
-        "已截屏 {}（{}x{}），测试色占比 {:.2}%",
+        "已截屏 {}（{}x{}），测试色占比 {:.2}%，非黑占比 {:.1}%，平均 RGB({}, {}, {})",
         out.display(),
         image.width,
         image.height,
-        ratio * 100.0
+        ratio * 100.0,
+        non_black * 100.0,
+        mean[0],
+        mean[1],
+        mean[2]
     );
     Ok(())
 }
