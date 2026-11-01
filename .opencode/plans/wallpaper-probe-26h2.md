@@ -216,6 +216,8 @@ SendMessageTimeout(Progman, 0x052C, wParam=0xD, lParam=0) -> ret=1
 - [x] **锁屏解锁** —— 已实测 2 轮（见 §7.9）；RDP 重连、休眠唤醒仍待验证
 - [x] **全屏应用 / 最大化窗口的暂停判定** —— 已实测，见 §7.9
 - [x] **长时间（≥ 30 分钟）稳定性与占用** —— 已实测，见 §7.10
+- [x] **最小化 / 还原 20 次后层级仍正确** —— 已实测，见 §7.11
+- [ ] 最小化后任务栏被盖住的 ≤2 s 窗口（可接 `SetWinEventHook` 缩短）
 
 ### 7.5 Explorer 重启：必须重启渲染进程
 
@@ -413,5 +415,43 @@ target\debug\wp-host.exe --no-pause --duration 1800
 注意这是**纯色 DComp 表面**的占用基线（渲染管线 + 合成开销），
 不代表视频解码负载——1080p H.264 的 CPU/GPU 需要等 M1 接入 mpv 后再测。
 `wp-host --no-pause` 只影响暂停判定，不改变渲染路径。
+
+### 7.11 最小化 / 还原 20 次压测（M0 验收第 3 条）
+
+工具：`wpctl cycles`——挂载后反复「最小化所有普通窗口 → 还原」，
+每次切换都用 `ensure_band` 核对层级，最后截屏确认画面仍可见。
+
+```bash
+cargo run -p wpctl -- cycles --count 20 --shot out\cycles.bmp
+cargo run -p wpctl -- cycles --count 20 --json   # 每轮明细：修正前图标层状态、z 链
+```
+
+20 轮实测（`defview_adopt` + DComp，settle 800 ms）：
+
+| 指标 | 结果 |
+|---|---|
+| 轮次 | 20 / 20（35 s） |
+| `ensure_band` 调用 | 41 次（20 最小化 + 20 还原 + 1 截图前） |
+| 修正 | 21 次（每次最小化后必然修正一次） |
+| `Lost` | **0** |
+| 终态 | `correct` / `corrected`，从未 `Lost` |
+| 截图 | 修正前 98.9% → 修正后 94.5% |
+
+**最小化会让 z 序漂移，但壁纸不会丢。** 所有窗口最小化后，被最小化的窗口沉到
+z 序底部，宿主相对位置上移，最终停在 `Shell_TrayWnd` 之上、`Progman` 之上：
+
+```
+最小化后： #235 <宿主> … #236 Shell_TrayWnd … #249 Progman
+修正后：   #247 Shell_TrayWnd | #248 <宿主> | #249 Progman
+```
+
+修正后宿主紧贴 `Progman` 上方（`is_at_bottom_of_band` 的定义），任务栏回到宿主之上。
+两次截图差 4.4% 正好是一条 48 px 任务栏——也就是说**修正窗口期内壁纸会盖住任务栏**，
+`wp-host` 的看门狗（2 s 一轮）会在一轮内纠正。壁纸本身全程可见（98.9%），
+不存在黑屏或图标丢失。
+
+结论：M0 验收第 3 条通过。可改进项：接 `SetWinEventHook(EVENT_OBJECT_REORDER /
+EVENT_SYSTEM_MINIMIZESTART / EVENT_SYSTEM_MINIMIZEEND)` 把「最小化后盖住任务栏」
+的窗口从 ≤2 s 压到一帧级；这属于 M0 打磨，不阻塞进入 M1。
 
 

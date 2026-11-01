@@ -74,6 +74,7 @@
 | 崩溃后桌面自愈 | **已实测**：硬杀会连 `DefView` 一起销毁 → 下次启动按崩溃记录自动重启 Explorer 恢复 |
 | 全屏独占游戏暂停判定 | **已实测**：`wpctl pause` 自测 + `wp-host` 前台切换，1 s 内暂停/恢复（§7.9） |
 | 长时间（≥ 30 分钟）稳定性 / GPU 占用 | **已实测**：30 分钟 0 漂移、CPU 0.1%、GPU 0.5%、无泄漏（§7.10） |
+| 最小化 / 还原 20 次 | **已实测**：0 Lost、壁纸全程可见；最小化后 z 序漂移由看门狗一轮内修正（§7.11） |
 
 **M0 尚未收尾，仍不要开始写业务代码。**
 
@@ -187,6 +188,8 @@ cargo run -p wpctl -- probe --strategy defview_adopt --content d3d --duration 60
 cargo run -p wpctl -- probe --strategy progman_child_top --content d3d --duration 10 --minimize --shot out\a_top.bmp
 # 全矩阵（含已证否策略，用于回归）
 cargo run -p wpctl -- probe --strategy all --duration 30
+# 最小化/还原 20 次压测（M0 验收第 3 条），结束时截屏确认画面仍可见
+cargo run -p wpctl -- cycles --count 20 --shot out\cycles.bmp
 # 桌面输入基线（不带壁纸）
 cargo run -p wpctl -- input-test --minimize
 # 暂停判定：一次性采样 / 连续观察 / 自测遮挡（小窗口模式用于观察恢复）
