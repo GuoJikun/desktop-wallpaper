@@ -17,6 +17,7 @@
 //! 3. 消息循环 + 约 2 s 一次的 z 序看门狗；
 //! 4. 退出前先 `detach`（把 `DefView` 还给 `Progman`）再销毁窗口。
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -154,6 +155,9 @@ struct Args {
     /// 测试内容：`d3d`（DComp 纯色，正式管线）或 `gdi`（纯色对照）
     #[arg(long, default_value = "d3d", value_parser = ["d3d", "gdi"])]
     content: String,
+    /// 图片壁纸路径（PNG / JPEG / BMP）。给定后自动使用 DComp 管线，忽略 `--content`
+    #[arg(long)]
+    image: Option<PathBuf>,
     /// 渲染帧率上限（纯色测试也走同一条节流路径）
     #[arg(long, default_value_t = 60)]
     fps: u32,
@@ -201,7 +205,13 @@ fn run() -> Result<i32> {
         .strategy
         .parse::<Strategy>()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let content = Content::parse(&args.content)?;
+    // 图片只能在 DComp 表面里画（窗口带 NOREDIRECTIONBITMAP 时 GDI 画不进去），
+    // 所以给了 `--image` 就锁定 d3d，不让 `--content gdi` 把它悄悄降级成纯色。
+    let content = if args.image.is_some() {
+        Content::D3d
+    } else {
+        Content::parse(&args.content)?
+    };
     let fps = args.fps.clamp(1, 240);
     let duration = (args.duration > 0).then(|| Duration::from_secs(args.duration));
 
@@ -211,11 +221,12 @@ fn run() -> Result<i32> {
         rect = ?monitor.rect,
         strategy = strategy.as_str(),
         content = content.as_str(),
+        image = args.image.as_ref().map(|p| p.display().to_string()),
         fps,
         "wp-host 启动"
     );
 
-    let mut session = Session::open(strategy, content, &monitor)?;
+    let mut session = Session::open(strategy, content, &monitor, args.image.as_deref())?;
     tracing::info!(window = ?session.hwnd, effective_content = session.content.as_str(), "已挂到桌面");
 
     // 锁屏/解锁、休眠/唤醒都靠这两类通知；失败只影响暂停策略，不影响壁纸。
@@ -496,10 +507,38 @@ struct Session {
     strategy: Strategy,
     device: String,
     rect: PhysicalRect,
+    /// 已缩放到屏幕尺寸的壁纸；`None` 表示画 M0 的测试纯色。
+    image: Option<wp_render::BgraImage>,
+    /// 图片路径。`restart` 要重新解码，所以留着原路径。
+    image_path: Option<PathBuf>,
+    /// 图片是否需要重画。静态壁纸只在加载后提交一帧。
+    dirty: bool,
 }
 
 impl Session {
-    fn open(strategy: Strategy, content: Content, monitor: &MonitorInfo) -> Result<Self> {
+    fn open(
+        strategy: Strategy,
+        content: Content,
+        monitor: &MonitorInfo,
+        image_path: Option<&Path>,
+    ) -> Result<Self> {
+        // 先解码再建窗口：图片坏了要立刻退出，绝不能先闪一个空窗口——
+        // 更别说桌面挂载一旦发生，`wpctl attach` 那边就会看到「窗口出现 = 成功」。
+        let image = match (content, image_path) {
+            (Content::D3d, Some(path)) => Some(
+                wp_render::decode_file(
+                    path,
+                    wp_render::PhysicalSize {
+                        width: monitor.rect.width,
+                        height: monitor.rect.height,
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!(e))
+                .with_context(|| format!("加载壁纸 {} 失败", path.display()))?,
+            ),
+            _ => None,
+        };
+
         let spec = HostWindowSpec::for_monitor(monitor.rect)
             .with_noredirection_bitmap(content == Content::D3d);
         let hwnd = create_host_window(&spec).context("创建宿主窗口失败")?;
@@ -520,10 +559,15 @@ impl Session {
                 Ok(surface) => Some(surface),
                 Err(e) => {
                     // 绝不能停在黑屏：拆掉 noredirection 窗口，用 GDI 纯色重来一次。
-                    tracing::warn!("D3D/DComp 初始化失败（{e}），退回 GDI 纯色");
+                    // 图片没法在 GDI 窗口里画，顺便说清楚降级了。
+                    if image_path.is_some() {
+                        tracing::warn!("D3D/DComp 不可用，图片壁纸降级为纯色（{e}）");
+                    } else {
+                        tracing::warn!("D3D/DComp 初始化失败（{e}），退回 GDI 纯色");
+                    }
                     let _ = host.detach(hwnd);
                     destroy_host_window(hwnd);
-                    return Self::open(strategy, Content::Gdi, monitor);
+                    return Self::open(strategy, Content::Gdi, monitor, None);
                 }
             }
         } else {
@@ -538,22 +582,37 @@ impl Session {
             strategy,
             device: monitor.device.clone(),
             rect: monitor.rect,
+            image,
+            image_path: image_path.map(Path::to_path_buf),
+            dirty: true,
         })
     }
 
     fn paint(&mut self) -> Result<()> {
-        match (&mut self.surface, self.content) {
-            (Some(surface), _) => surface.clear(TEST_RGB).map_err(|e| anyhow::anyhow!(e)),
-            (None, Content::Gdi) => {
-                paint_solid(self.hwnd, TEST_COLOR).map_err(|e| anyhow::anyhow!(e))
+        if let Some(surface) = self.surface.as_mut() {
+            if let Some(image) = self.image.as_ref() {
+                // 静态壁纸：只有加载完 / 换屏之后需要提交一帧。
+                if !self.dirty {
+                    return Ok(());
+                }
+                surface
+                    .draw_bgra(image.width, image.height, &image.pixels)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                self.dirty = false;
+                return Ok(());
             }
-            (None, Content::D3d) => Ok(()),
+            return surface.clear(TEST_RGB).map_err(|e| anyhow::anyhow!(e));
+        }
+        match self.content {
+            Content::Gdi => paint_solid(self.hwnd, TEST_COLOR).map_err(|e| anyhow::anyhow!(e)),
+            Content::D3d => Ok(()),
         }
     }
 
     /// 先完整还原桌面，再按新矩形重建整个会话。
     fn restart(&mut self, rect: PhysicalRect) -> Result<()> {
         let (strategy, content, device) = (self.strategy, self.content, self.device.clone());
+        let image_path = self.image_path.clone();
         self.teardown();
         // 先移动旧窗口已经没意义了（teardown 已销毁），这里创建新窗口时直接用新矩形。
         let monitor = MonitorInfo {
@@ -562,13 +621,14 @@ impl Session {
             rect,
             primary: false,
         };
-        *self = Self::open(strategy, content, &monitor)?;
+        *self = Self::open(strategy, content, &monitor, image_path.as_deref())?;
         Ok(())
     }
 
     fn teardown(&mut self) {
         // DComp 表面先于窗口释放：它持有 hwnd 的 target。
         self.surface = None;
+        self.image = None;
         if self.hwnd == 0 {
             return;
         }
