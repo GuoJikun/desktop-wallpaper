@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -170,6 +171,9 @@ struct Args {
     /// 跳过启动时的桌面自愈（仅用于验证自愈逻辑本身）
     #[arg(long)]
     no_heal: bool,
+    /// 不监听命名管道（调试用；`wpctl attach` 就无法热换图了）
+    #[arg(long)]
+    no_ipc: bool,
 }
 
 fn main() {
@@ -215,7 +219,7 @@ fn run() -> Result<i32> {
     let fps = args.fps.clamp(1, 240);
     let duration = (args.duration > 0).then(|| Duration::from_secs(args.duration));
 
-    let monitor = resolve_monitor(args.device.as_deref(), args.monitor)?;
+    let (monitor_index, monitor) = resolve_monitor(args.device.as_deref(), args.monitor)?;
     tracing::info!(
         device = %monitor.device,
         rect = ?monitor.rect,
@@ -234,7 +238,17 @@ fn run() -> Result<i32> {
     install_console_handler();
     HOST_HWND.store(session.hwnd, Ordering::Relaxed);
 
-    let result = event_loop(&mut session, fps, duration, !args.no_pause);
+    // IPC 线程只负责「收命令、回事件」，真正改 Session 的活留给主循环：
+    // 会话里有窗口、D3D 表面和桌面挂载，跨线程共享只会引入新的竞态。
+    let (ipc_tx, ipc_rx) = mpsc::channel();
+    if args.no_ipc {
+        tracing::info!("已关闭 IPC（--no-ipc）");
+    } else {
+        let name = wp_ipc::pipe_name(wp_platform::current_session_id(), monitor_index as u32);
+        spawn_ipc(name, ipc_tx);
+    }
+
+    let result = event_loop(&mut session, &ipc_rx, fps, duration, !args.no_pause);
 
     HOST_HWND.store(0, Ordering::Relaxed);
     // 顺序很重要：先放掉 DComp 表面，再把 DefView 还给 Progman，最后销毁窗口。
@@ -246,6 +260,7 @@ fn run() -> Result<i32> {
 
 fn event_loop(
     session: &mut Session,
+    ipc_rx: &Receiver<IpcRequest>,
     fps: u32,
     duration: Option<Duration>,
     pause_detection: bool,
@@ -303,6 +318,33 @@ fn event_loop(
                 }
                 Err(GeometryError::Failed(e)) => return Err(e),
             }
+        }
+
+        // IPC 换图：命令来自 wpctl / supervisor。放在暂停早退之前，
+        // 这样锁屏/休眠时也能及时回应客户端；是否立刻重绘再按暂停状态判断。
+        match ipc_rx.try_recv() {
+            Ok(IpcRequest::LoadFile { path, reply }) => {
+                let result = session.load_file(&path);
+                match &result {
+                    Ok((width, height)) => {
+                        tracing::info!(path = %path.display(), width = *width, height = *height, "通过 IPC 换图");
+                        if !events.locked && !events.suspended && pause_reasons.is_empty() {
+                            if let Err(e) = session.paint() {
+                                tracing::warn!("换图后绘制失败: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(path = %path.display(), "通过 IPC 换图失败: {e}"),
+                }
+                // `{:#}` 打出整条错误链：客户端看到的不只是「加载壁纸失败」，
+                // 还包含底层的「无法识别图片格式」之类真正有用的原因。
+                let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+            }
+            Ok(IpcRequest::Shutdown) => {
+                tracing::info!("收到 IPC 退出请求，准备还原桌面");
+                return Ok(0);
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
         }
 
         let paused = events.locked || events.suspended;
@@ -396,19 +438,21 @@ fn frame_interval(content: Content, fps: u32) -> Duration {
     }
 }
 
-fn resolve_monitor(device: Option<&str>, index: usize) -> Result<MonitorInfo> {
+fn resolve_monitor(device: Option<&str>, index: usize) -> Result<(usize, MonitorInfo)> {
     let monitors = enumerate_monitors();
     let total = monitors.len();
     if let Some(device) = device {
-        return monitors
-            .into_iter()
-            .find(|m| m.device.eq_ignore_ascii_case(device))
-            .with_context(|| format!("找不到显示器 {device}（当前共 {total} 台）"));
+        let position = monitors
+            .iter()
+            .position(|m| m.device.eq_ignore_ascii_case(device))
+            .with_context(|| format!("找不到显示器 {device}（当前共 {total} 台）"))?;
+        return Ok((position, monitors[position].clone()));
     }
-    monitors
+    let monitor = monitors
         .into_iter()
         .nth(index)
-        .with_context(|| format!("显示器索引 {index} 不存在（当前共 {total} 台）"))
+        .with_context(|| format!("显示器索引 {index} 不存在（当前共 {total} 台）"))?;
+    Ok((index, monitor))
 }
 
 /// 显示器几何变化：按设备名找同一块屏；没变就什么都不做。
@@ -433,6 +477,125 @@ fn refresh_geometry(
 enum GeometryError {
     MonitorGone,
     Failed(anyhow::Error),
+}
+
+/// IPC 请求在主线程里最多等多久。图片解码是同步的 CPU 工作，
+/// 4K 图 + 机械盘也可控；超过这个时间说明主循环卡住，必须让客户端知道。
+const IPC_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 来自 IPC 线程的请求。
+///
+/// 只有「必须访问 [`Session`]」的命令走这条通道：管道线程永远不碰
+/// 窗口、D3D 表面和桌面挂载，避免把竞态引进最难调试的那一层。
+enum IpcRequest {
+    LoadFile {
+        path: PathBuf,
+        reply: Sender<std::result::Result<(u32, u32), String>>,
+    },
+    Shutdown,
+}
+
+/// 起一个专用线程做管道 server。
+///
+/// 线程永远阻塞在 `accept` / `read_frame` 上，进程退出时随之结束：
+/// 不需要 join，也不会拖住优雅退出（主循环返回后 `main` 直接 `process::exit`）。
+fn spawn_ipc(name: String, tx: Sender<IpcRequest>) {
+    let spawned = std::thread::Builder::new()
+        .name("wp-ipc".into())
+        .spawn(move || {
+            let server = wp_ipc::pipe::PipeServer::bind(&name);
+            tracing::info!(pipe = %name, "IPC 已监听");
+            loop {
+                let mut conn = match server.accept() {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::warn!("IPC 接受连接失败: {e}");
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                };
+                tracing::debug!("IPC 客户端已连接");
+                if let Err(e) = serve_connection(&mut conn, &tx) {
+                    // 客户端正常断开也会走到这里（读不到更多帧），日志留 debug 即可。
+                    tracing::debug!("IPC 连接结束: {e}");
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("IPC 线程启动失败，热换图不可用: {e}");
+    }
+}
+
+/// 一次连接的生命周期：读一条命令，回一条事件，直到客户端断开。
+///
+/// 现在只做「一问一答」：`wpctl attach` 发完 `LoadFile` 就读回应。
+/// 长时间的统计推送（`Stats`）留给 supervisor，那时会需要读超时或异步 IO。
+fn serve_connection(
+    conn: &mut std::fs::File,
+    tx: &Sender<IpcRequest>,
+) -> std::result::Result<(), wp_ipc::FrameError> {
+    loop {
+        let command: wp_ipc::Command = wp_ipc::read_frame(conn)?;
+        match command {
+            wp_ipc::Command::LoadFile { path } => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx
+                    .send(IpcRequest::LoadFile {
+                        path: path.clone(),
+                        reply: reply_tx,
+                    })
+                    .is_err()
+                {
+                    let _ = wp_ipc::write_frame(
+                        conn,
+                        &wp_ipc::Event::Error {
+                            code: wp_ipc::ErrorCode::Internal,
+                            message: "宿主主循环已退出".into(),
+                        },
+                    );
+                    return Ok(());
+                }
+
+                let event = match reply_rx.recv_timeout(IPC_TIMEOUT) {
+                    Ok(Ok((width, height))) => wp_ipc::Event::Loaded {
+                        path: path.display().to_string(),
+                        width,
+                        height,
+                    },
+                    Ok(Err(message)) => wp_ipc::Event::Error {
+                        code: wp_ipc::ErrorCode::Decode,
+                        message,
+                    },
+                    Err(_) => wp_ipc::Event::Error {
+                        code: wp_ipc::ErrorCode::Internal,
+                        message: format!("宿主 {} 秒内没有响应", IPC_TIMEOUT.as_secs()),
+                    },
+                };
+                wp_ipc::write_frame(conn, &event)?;
+            }
+            wp_ipc::Command::Shutdown => {
+                let _ = wp_ipc::write_frame(
+                    conn,
+                    &wp_ipc::Event::Log {
+                        level: 1,
+                        message: "正在退出".into(),
+                    },
+                );
+                let _ = tx.send(IpcRequest::Shutdown);
+                return Ok(());
+            }
+            other => {
+                tracing::warn!(?other, "IPC 收到暂不支持的命令");
+                wp_ipc::write_frame(
+                    conn,
+                    &wp_ipc::Event::Error {
+                        code: wp_ipc::ErrorCode::Unsupported,
+                        message: format!("{other:?} 暂不支持"),
+                    },
+                )?;
+            }
+        }
+    }
 }
 
 /// 本次消息泵里收集到的、需要主循环处理的系统事件。
@@ -607,6 +770,30 @@ impl Session {
             Content::Gdi => paint_solid(self.hwnd, TEST_COLOR).map_err(|e| anyhow::anyhow!(e)),
             Content::D3d => Ok(()),
         }
+    }
+
+    /// 换一张图：解码到当前屏幕尺寸并标记重绘。
+    ///
+    /// 解码留在主线程而不是 IPC 线程：显示器变化后 `self.rect` 才是最新的，
+    /// 而且这里能顺带确认表面还在（GDI 降级模式下没有地方画图片）。
+    fn load_file(&mut self, path: &Path) -> Result<(u32, u32)> {
+        if self.surface.is_none() {
+            bail!("当前是 GDI 降级模式，无法加载图片");
+        }
+        let image = wp_render::decode_file(
+            path,
+            wp_render::PhysicalSize {
+                width: self.rect.width,
+                height: self.rect.height,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!(e))
+        .with_context(|| format!("加载壁纸 {} 失败", path.display()))?;
+        let size = (image.width, image.height);
+        self.image = Some(image);
+        self.image_path = Some(path.to_path_buf());
+        self.dirty = true;
+        Ok(size)
     }
 
     /// 先完整还原桌面，再按新矩形重建整个会话。
