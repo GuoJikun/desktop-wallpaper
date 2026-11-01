@@ -17,7 +17,7 @@
 //! 3. 消息循环 + 约 2 s 一次的 z 序看门狗；
 //! 4. 退出前先 `detach`（把 `DefView` 还给 `Progman`）再销毁窗口。
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -29,10 +29,13 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, PostMessageW, TranslateMessage, MSG, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PM_REMOVE, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_ENDSESSION, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    DispatchMessageW, PeekMessageW, PostMessageW, TranslateMessage, EVENT_OBJECT_REORDER,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, MSG,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, PM_REMOVE, WINEVENT_OUTOFCONTEXT,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_POWERBROADCAST,
+    WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use wp_core::PhysicalRect;
@@ -52,6 +55,85 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 暂停判定周期。全屏应用切进切出比 z 序漂移快，1 s 足够且开销可忽略。
 const PAUSE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 事件触发的 z 序核对最小间隔。
+///
+/// `EVENT_OBJECT_REORDER` 在拖窗口、Alt+Tab 时会连续爆发，而每次核对都要遍历整条
+/// z 链；限流到 5 次/秒既能把「最小化后壁纸短暂盖住任务栏」缩到肉眼一瞬，
+/// 也不会在快速切换窗口时把 CPU 打上去。
+const EVENT_RECHECK_INTERVAL: Duration = Duration::from_millis(200);
+
+/// z 序事件标志。事件回调只置位，真正的核对留给事件循环——回调里不能做重活。
+static Z_EVENT: AtomicBool = AtomicBool::new(false);
+
+/// 订阅「可能改 z 序」的 WinEvent。
+///
+/// `WINEVENT_OUTOFCONTEXT` 的回调在我们的消息循环里执行，不需要单独线程。
+/// 菜单、焦点、名称变更之类的事件也会走到回调，所以先按事件号过滤。
+struct ZEventHooks {
+    hooks: [HWINEVENTHOOK; 2],
+}
+
+impl ZEventHooks {
+    fn install() -> Self {
+        let proc = Some(win_event_proc as _);
+        let hooks = unsafe {
+            [
+                SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_MINIMIZEEND,
+                    None,
+                    proc,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                ),
+                SetWinEventHook(
+                    EVENT_OBJECT_REORDER,
+                    EVENT_OBJECT_REORDER,
+                    None,
+                    proc,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                ),
+            ]
+        };
+        Self { hooks }
+    }
+}
+
+impl Drop for ZEventHooks {
+    fn drop(&mut self) {
+        for hook in self.hooks {
+            if !hook.is_invalid() {
+                unsafe {
+                    let _ = UnhookWinEvent(hook);
+                }
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn win_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if matches!(
+        event,
+        EVENT_SYSTEM_FOREGROUND
+            | EVENT_SYSTEM_MINIMIZESTART
+            | EVENT_SYSTEM_MINIMIZEEND
+            | EVENT_OBJECT_REORDER
+    ) {
+        Z_EVENT.store(true, Ordering::Relaxed);
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -160,8 +242,14 @@ fn event_loop(
     let started = Instant::now();
     let frame_interval = frame_interval(session.content, fps);
 
+    // z 序事件只用来「提前叫醒」看门狗；装不上也不影响 2 s 定时核对。
+    let _z_hooks = ZEventHooks::install();
+    Z_EVENT.store(false, Ordering::Relaxed);
+
     let mut events = Events::default();
     let mut next_check = Instant::now();
+    let mut last_event_check = Instant::now();
+    let mut event_checks = 0u64;
     let mut next_frame = Instant::now();
     let mut next_pause_check = Instant::now();
     let mut pause_reasons: Vec<wp_platform::PauseReason> = Vec::new();
@@ -177,7 +265,12 @@ fn event_loop(
         }
         if let Some(limit) = duration {
             if started.elapsed() >= limit {
-                tracing::info!(seconds = limit.as_secs(), "运行时间到，正常退出");
+                tracing::info!(
+                    seconds = limit.as_secs(),
+                    corrections,
+                    event_checks,
+                    "运行时间到，正常退出"
+                );
                 return Ok(0);
             }
         }
@@ -240,6 +333,15 @@ fn event_loop(
                 pause_reasons = report.reasons;
             }
             next_pause_check = now + PAUSE_INTERVAL;
+        }
+
+        // 前台切换 / 最小化 / 窗口重排会立刻改 z 序：不等 2 s 定时器，尽快核对一次。
+        if Z_EVENT.swap(false, Ordering::Relaxed)
+            && now.duration_since(last_event_check) >= EVENT_RECHECK_INTERVAL
+        {
+            last_event_check = now;
+            event_checks += 1;
+            next_check = now;
         }
 
         if now >= next_check {

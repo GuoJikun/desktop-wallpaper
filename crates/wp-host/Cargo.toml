@@ -24,5 +24,6 @@ windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_System_RemoteDesktop",
+    "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",
 ] }
