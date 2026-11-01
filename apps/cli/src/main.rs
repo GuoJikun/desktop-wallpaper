@@ -355,9 +355,34 @@ fn attach(
     }
 
     let exe = host_exe()?;
-    let before = wp_platform::host_windows().len();
-    if before > 0 {
-        eprintln!("[attach] 已经有 {before} 个宿主窗口在运行，先挂的会被新窗口盖住");
+    // 只看这一块屏：其它显示器有宿主不代表这块屏已经挂了壁纸。
+    let before = wp_platform::host_windows_on(monitor.rect);
+
+    // 优先走 IPC：宿主已经在跑时只换内容，不重建进程和桌面挂载。
+    // 有宿主时多等一会儿——它可能刚被拉起，管道还没开始监听。
+    let pipe = wp_ipc::pipe_name(wp_platform::current_session_id(), monitor_idx as u32);
+    let timeout = if before > 0 {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(250)
+    };
+    match ipc_load(&pipe, &source, timeout)? {
+        Some((width, height)) => {
+            println!(
+                "已让运行中的宿主换图 → 显示器 [{monitor_idx}] {} {}x{}（解码后 {width}x{height}）",
+                monitor.device, monitor.rect.width, monitor.rect.height
+            );
+            return Ok(());
+        }
+        None => {
+            if before > 0 {
+                // 绝不能再起一个：两个宿主会抢同一块屏，图标层必然出事。
+                bail!(
+                    "显示器 [{monitor_idx}] 已有 {before} 个宿主窗口，但管道 {pipe} 没有监听\
+                     （可能是 `--no-ipc` 启动的）；先 `wpctl stop` 再 attach"
+                );
+            }
+        }
     }
 
     // 日志落文件而不是继承控制台：wp-host 是常驻进程，继承了控制台的管道会让
@@ -410,7 +435,7 @@ fn attach(
                 log.display()
             );
         }
-        if wp_platform::host_windows().len() > before {
+        if wp_platform::host_windows_on(monitor.rect) > before {
             // 窗口出现只是第一步：解码失败或表面初始化失败会让进程在窗口出来之后
             // 立刻退出。稍等一拍再确认它还活着，避免报「成功」之后图标层没人管。
             std::thread::sleep(Duration::from_millis(400));
@@ -438,6 +463,40 @@ fn attach(
             );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 让已经在运行的宿主换图。
+///
+/// 返回 `Ok(None)` 表示没有任何进程在监听这个管道——调用方可以安全地新起宿主。
+/// 返回 `Err` 表示宿主确实在跑，但拒绝/无法完成换图：此时绝不能另起一个进程。
+fn ipc_load(pipe: &str, source: &Path, timeout: Duration) -> Result<Option<(u32, u32)>> {
+    let mut conn = match wp_ipc::pipe::connect(pipe, timeout) {
+        Ok(conn) => conn,
+        Err(wp_ipc::pipe::PipeError::NotRunning) => return Ok(None),
+        Err(e) => bail!("连接宿主管道 {pipe} 失败: {e}"),
+    };
+
+    wp_ipc::write_frame(
+        &mut conn,
+        &wp_ipc::Command::LoadFile {
+            path: source.to_path_buf(),
+        },
+    )
+    .context("发送换图命令失败")?;
+
+    let event: wp_ipc::Event = wp_ipc::read_frame(&mut conn).context("读取宿主回应失败")?;
+    match event {
+        wp_ipc::Event::Loaded {
+            path,
+            width,
+            height,
+        } => {
+            println!("宿主回报已加载 {path}");
+            Ok(Some((width, height)))
+        }
+        wp_ipc::Event::Error { code, message } => bail!("宿主拒绝换图（{code:?}）: {message}"),
+        other => bail!("宿主返回了意料之外的事件: {other:?}"),
     }
 }
 

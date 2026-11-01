@@ -871,6 +871,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wp-core",
+ "wp-ipc",
  "wp-platform",
 ]
 

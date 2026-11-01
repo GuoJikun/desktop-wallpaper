@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 wp-core.workspace = true
+wp-ipc.workspace = true
 wp-platform.workspace = true
 anyhow.workspace = true
 clap.workspace = true
