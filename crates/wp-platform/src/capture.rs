@@ -71,6 +71,51 @@ impl ScreenImage {
         }
         count
     }
+
+    /// 全屏平均色。图片壁纸没有「测试色」可比，用它加 [`Self::non_black_ratio`]
+    /// 就能区分「画出了东西」和「黑屏 / 纯色兜底」。
+    pub fn mean_rgb(&self) -> [u8; 3] {
+        let mut sum = [0u64; 3];
+        let mut n = 0u64;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let Some([r, g, b]) = self.pixel(x, y) else {
+                    continue;
+                };
+                sum[0] += r as u64;
+                sum[1] += g as u64;
+                sum[2] += b as u64;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return [0, 0, 0];
+        }
+        [
+            (sum[0] / n) as u8,
+            (sum[1] / n) as u8,
+            (sum[2] / n) as u8,
+        ]
+    }
+
+    /// 非纯黑像素占比（0.0–1.0）。黑屏 ≈ 0.0，铺满图片 ≈ 1.0。
+    ///
+    /// 只要三个通道有一个不为 0 就算「非黑」，暗色壁纸不会被误判成黑屏。
+    pub fn non_black_ratio(&self) -> f32 {
+        let total = (self.width * self.height) as f32;
+        if total == 0.0 {
+            return 0.0;
+        }
+        let mut hits = 0u64;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.pixel(x, y) != Some([0, 0, 0]) {
+                    hits += 1;
+                }
+            }
+        }
+        hits as f32 / total
+    }
 }
 
 /// 抓取虚拟桌面的一部分。
@@ -201,6 +246,24 @@ mod tests {
         assert_eq!(image.width, 64);
         assert_eq!(image.height, 64);
         assert_eq!(image.bgr.len(), (image.stride * 64) as usize);
+    }
+
+    #[test]
+    fn mean_rgb_and_non_black_follow_pixels() {
+        // 2x2、bottom-up：顶行 = 左红右黑，底行全黑。
+        let image = ScreenImage {
+            width: 2,
+            height: 2,
+            stride: 8,
+            bgr: vec![
+                0, 0, 0, 0, 0, 0, 0, 0, // 底行（先存）
+                0, 0, 255, 0, 0, 0, 0, 0, // 顶行：红 + 黑
+            ],
+        };
+        assert_eq!(image.pixel(0, 0), Some([255, 0, 0]));
+        assert_eq!(image.pixel(1, 1), Some([0, 0, 0]));
+        assert_eq!(image.mean_rgb(), [63, 0, 0]);
+        assert!((image.non_black_ratio() - 0.25).abs() < f32::EPSILON);
     }
 
     #[test]
