@@ -8,6 +8,7 @@ pub mod desktop;
 pub mod input;
 pub mod monitor;
 pub mod pause;
+pub mod session;
 pub mod window;
 
 pub use capture::{capture, save_bmp, ScreenImage};
@@ -24,6 +25,7 @@ pub use monitor::{enumerate_monitors, MonitorInfo};
 pub use pause::{
     decide, sample, ForegroundWindow, PauseFlags, PauseInputs, PauseReason, PauseReport,
 };
+pub use session::current_session_id;
 pub use window::{
     activate_window, class_at_point, close_host_windows, create_host_window, create_probe_window,
     describe, destroy_host_window, host_windows, is_host_window_alive, is_minimized,
