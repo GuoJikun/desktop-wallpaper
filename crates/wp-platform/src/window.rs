@@ -20,11 +20,11 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EnumWindows, GetClassNameW, GetClientRect, GetParent, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW, RegisterClassExW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WindowFromPoint, GWL_EXSTYLE,
-    GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
-    WM_NCHITTEST, WNDCLASSEXW, WNDCLASS_STYLES, WNDPROC,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW, PostMessageW,
+    RegisterClassExW, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage,
+    WindowFromPoint, GWL_EXSTYLE, GWL_STYLE, HTTRANSPARENT, MSG, PM_REMOVE, SET_WINDOW_POS_FLAGS,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_ERASEBKGND, WM_NCHITTEST, WNDCLASSEXW, WNDCLASS_STYLES, WNDPROC,
 };
 
 use wp_core::PhysicalRect;
@@ -232,6 +232,42 @@ pub fn move_host_window(hwnd: isize, rect: PhysicalRect) -> Result<()> {
 /// 句柄是否仍然有效。
 pub fn is_host_window_alive(hwnd: isize) -> bool {
     unsafe { IsWindow(Some(raw(hwnd))).as_bool() }
+}
+
+/// 枚举本机所有 `WallpaperHostWindow`（`wp-host` 进程的宿主窗口）。
+///
+/// 不按 PID 记录：进程被 supervisor 重启几轮后 PID 就变了，而窗口类名是稳定的。
+pub fn host_windows() -> Vec<isize> {
+    let mut list: Vec<isize> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_host_window),
+            LPARAM(&mut list as *mut _ as isize),
+        );
+    }
+    list
+}
+
+unsafe extern "system" fn collect_host_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    if class_name(hwnd) == WINDOW_CLASS {
+        let list = &mut *(lparam.0 as *mut Vec<isize>);
+        list.push(hwnd.0 as isize);
+    }
+    BOOL(1)
+}
+
+/// 给所有宿主窗口发 `WM_CLOSE`，返回发送数量。
+///
+/// 必须走优雅退出：策略 E 下 `SHELLDLL_DefView` 是我们的子窗口，
+/// 硬杀会把用户桌面图标层一起销毁（见 AGENTS.md 硬规则 3 第五条）。
+pub fn close_host_windows() -> usize {
+    let windows = host_windows();
+    for &hwnd in &windows {
+        unsafe {
+            let _ = PostMessageW(Some(raw(hwnd)), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    windows.len()
 }
 
 /// 窗口是否处于最小化状态。
