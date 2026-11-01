@@ -270,6 +270,22 @@ pub fn close_host_windows() -> usize {
     windows.len()
 }
 
+/// 有多少个宿主窗口落在指定显示器矩形内。
+///
+/// 多屏时用它区分「本屏已经有宿主」和「别的屏有宿主」：只有前者才该走 IPC 换图，
+/// 后者只是说明这台机器上还有别处的渲染进程。宿主窗口永远与显示器左上角对齐，
+/// 所以比较原点即可。
+pub fn host_windows_on(rect: PhysicalRect) -> usize {
+    host_windows()
+        .into_iter()
+        .filter(|&hwnd| {
+            let mut r = RECT::default();
+            let ok = unsafe { GetWindowRect(raw(hwnd), &mut r) }.is_ok();
+            ok && r.left == rect.x && r.top == rect.y
+        })
+        .count()
+}
+
 /// 窗口是否处于最小化状态。
 ///
 /// `Win+D`（显示桌面）会把顶层窗口最小化，子窗口跟着一起下去——
