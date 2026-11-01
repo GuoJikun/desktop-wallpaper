@@ -6,6 +6,7 @@ members = [
     "crates/wp-platform",
     "crates/wp-render",
     "crates/wp-host",
+    "crates/wp-supervisor",
     "apps/cli",
 ]
 

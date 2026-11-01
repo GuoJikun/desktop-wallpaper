@@ -862,6 +862,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wp-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tracing",
+ "tracing-subscriber",
+ "windows",
+ "wp-core",
+ "wp-ipc",
+ "wp-platform",
+]
+
+[[package]]
 name = "wpctl"
 version = "0.1.0"
 dependencies = [
