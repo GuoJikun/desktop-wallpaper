@@ -140,12 +140,24 @@ impl DefViewAdopt {
     }
 
     /// 还原：DefView 还给 Progman，并铺满整个屏。
+    ///
+    /// 只还原「当前父窗口确实是我们」的那一个。Explorer 重启后，进程里记着的旧句柄
+    /// 可能已经被回收给**新的** `DefView`（甚至挂在新壳层的别的窗口下）；
+    /// 这时再 `SetParent` 回 `Progman` 会把 Explorer 刚建好的桌面树弄乱。
     fn restore(&mut self, rect: PhysicalRect) -> Result<()> {
         if self.defview == 0 {
             return Ok(());
         }
-        if !unsafe { IsWindow(Some(raw(self.defview))).as_bool() } {
+        let defview = raw(self.defview);
+        if !unsafe { IsWindow(Some(defview)) }.as_bool() {
             return Ok(());
+        }
+        if let Some(parent) = unsafe { GetParent(defview) }.ok() {
+            let parent_is_host = self.host != 0 && parent == raw(self.host);
+            // 有父窗口但不是我们：说明它已被别人接手，别动。
+            if !parent.0.is_null() && !parent_is_host {
+                return Ok(());
+            }
         }
         self.adopt(HWND(std::ptr::null_mut()), rect)
     }
