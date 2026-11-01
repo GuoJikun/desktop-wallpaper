@@ -223,7 +223,25 @@ pub trait Presenter: Send {
 }
 ```
 
-### 4.2 视频后端
+### 4.2 图片后端（M1，已实现）
+
+| 步骤 | 位置 | 说明 |
+|---|---|---|
+| 解码 | `wp-render::image_backend` | `image` crate，只开 PNG / JPEG / BMP |
+| 缩放 | 同上（CPU） | cover：等比放大到填满再居中裁切；宽高比用整数交叉相乘比较 |
+| 上屏 | `wp-platform::DcompSurface::draw_bgra` | 整屏 BGRA 一次 `UpdateSubresource` + `Present` |
+
+关键取舍：
+
+- **不用着色器**：静态图片只需要整块内存拷贝，省掉顶点/像素着色器、采样器和
+  `d3dcompiler_47.dll` 依赖，运行期少一个失败点。
+- **静态内容只提交一次**：`wp-host` 用 `dirty` 标志，加载 / 换屏后 `Present` 一帧就停，
+  闲置开销与纯色基线一致。
+- **先解码后建窗口**：图片坏了立刻退出并打印原因（`wpctl attach` 会显示日志尾部），
+  避免「窗口出来了但内容不对」的误导状态。
+- **cover 而不是 contain**：桌面上不允许留黑边；代价是比例不符的图片会被裁掉边缘。
+
+### 4.3 视频后端
 
 阶段一（M1）：**外部 `mpv.exe --wid=<hwnd>`** + `--input-ipc-server` 控制。
 
@@ -237,7 +255,7 @@ pub trait Presenter: Send {
 
 **这个决策必须在 M0 结束前定稿**，写入 ADR。
 
-### 4.3 网页后端
+### 4.4 网页后端
 
 WebView2 直接嵌入宿主 HWND（不用 Tauri 窗口）：
 
@@ -246,7 +264,7 @@ WebView2 直接嵌入宿主 HWND（不用 Tauri 窗口）：
 - 属性桥：`window.wallpaperPropertyListener` 风格 API，通过 `postMessage` 双向通信
 - 音频响应：宿主进程采集 WASAPI loopback → 计算频段 → 以 30 Hz 推送数组
 
-### 4.4 场景后端（M3+）
+### 4.5 场景后端（M3+）
 
 - `wgpu` + 自研场景格式（节点树 + 材质 + 粒子系统）
 - 先支持：静态模型（glTF）、相机、光照、粒子发射器

@@ -165,18 +165,45 @@ wpctl probe --strategy all --content gdi,d3d --duration 30 --report out/report.j
 
 1. `wp-core` 领域模型 + SQLite schema
 2. `wp-ipc` 协议与管道实现（含超时、重连）
-3. `wp-host` 骨架：窗口 + 图片后端（最小闭环）
-4. `wpctl attach` 打通：能手动挂一张图
-5. 视频后端：外部 mpv 进程
+3. ✅ `wp-host` 骨架：窗口 + 图片后端（最小闭环）
+4. ✅ `wpctl attach` 打通：能手动挂一张图
+5. 视频后端：外部 mpv 进程（**等许可证定稿**）
 6. Tauri UI：库 + 预览 + 托盘
-7. 暂停规则（全屏/锁屏/电池）
-8. 自启、单实例、崩溃重启
+7. ✅ 暂停规则（全屏/锁屏/电池，M0 期间完成）
+8. 自启、单实例、崩溃重启（`wp-supervisor`）
 
 > 顺序原则：**先打通"进程 → 窗口 → 像素"，再做 UI**。UI 是最后一块。
 
 ### 4.3 通过标准
 
 非技术用户能把一个视频设为壁纸，连续一周不需人工干预；Explorer 重启、锁屏、睡眠唤醒后自动恢复。
+
+### 4.4 已完成：图片最小闭环（2026-11-01）
+
+| 项 | 实现 |
+|---|---|
+| 解码 / 缩放 | `wp-render::image_backend`（`decode_file` / `decode` / `cover_size`），只收 PNG / JPEG / BMP |
+| 上屏 | `DcompSurface::draw_bgra`：`UpdateSubresource` 写交换链后备缓冲 + `Present` |
+| 宿主 | `wp-host --image <path>`：先解码再建窗口；静态图只提交一帧 |
+| 控制 | `wpctl attach --monitor N --source <file>`（另有 `--no-pause` / `--duration`）、`wpctl stop` |
+
+实测（单屏 1920×1080，策略 E + DComp）：
+
+| 用例 | 结果 |
+|---|---|
+| 1920×1080 四象限图 | 截图平均色 `RGB(130,132,66)`，与四色理论均值 `(127,127,63)` 一致；图标、任务栏都在最上层 |
+| 同一张图存成 PNG / JPEG / BMP | 三种格式平均色都是 `RGB(130,132,66)`，解码器全部走通 |
+| 1600×1200 三条横带（比屏幕「高」） | cover 后上/下各裁 180 px，只剩 300 / 480 / 300 行的红绿蓝，证明是裁切而不是拉伸 |
+| 损坏的 `.png` | `wp-host` 在创建窗口前退出（exit 1），`wpctl attach` 打印日志里的解码错误 |
+
+已知约束：
+
+- 还没接 IPC：`attach` 直接拉起进程，换壁纸要 `stop` 再 `attach`。
+- 幻灯片、多屏分配、配置落库尚未做。
+- 截图验证时前台若被全屏 / 最大化窗口占着，暂停判定会让壁纸先停绘——
+  这是正确行为，调试时加 `--no-pause`。
+- `wpctl attach` 拉起的 `wp-host` 与调用者同一控制台进程组：Ctrl+C 会走优雅退出；
+  显式停止用 `wpctl stop`（发 `WM_CLOSE`，禁止硬杀）。
 
 ---
 

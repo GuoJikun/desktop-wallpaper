@@ -61,6 +61,8 @@
 - 26H2 桌面挂载层攻坚：**策略 E「反向接管 `SHELLDLL_DefView`」实测通过**
   （壁纸铺满、图标正常、右键/单击/双击正常、150 秒零漂移）。
 - 策略 A / B / D 全部证否并记录原因（见 `.opencode/plans/wallpaper-probe-26h2.md` §6–§7）。
+- **M1 图片壁纸最小闭环**：`wp-render` 解码 + cover 缩放 → BGRA，`DcompSurface::draw_bgra`
+  一次 `UpdateSubresource` 上屏，`wp-host --image`，`wpctl attach|stop`（见 `docs/implementation.md` §4.4）。
 
 ### 最高风险（M0 收尾要解决）
 挂载机制已确定，剩下的是**边界条件**而不是可行性：
@@ -77,7 +79,8 @@
 | 最小化 / 还原 20 次 | **已实测**：0 Lost、壁纸全程可见；z 序漂移由事件触发在 0.2 s 内修正（§7.11、§7.12） |
 | 任务视图（`Win+Tab`） | **已实测**：开关任务视图不改 z 带，无 `Lost`、无需修正（§7.13） |
 
-**M0 尚未收尾，仍不要开始写业务代码。**
+**M0 判定为通过**（多屏 / RDP / 休眠受当前环境限制，留到有设备时补测），
+已转入 **M1：图片壁纸最小闭环**。视频后端仍卡在许可证选择上。
 
 ---
 
@@ -201,7 +204,10 @@ cargo run -p wpctl -- pause --self-test --size 320x200 --hold 6000
 # 稳定性长测：30 分钟，每 30 s 采样 CPU/GPU，产物在 out/
 pwsh -NoProfile -File scripts/soak-sampler.ps1 -Duration 1800
 cargo run -p wpctl -- shot --out out\shot.bmp
-cargo run -p wpctl -- attach --monitor 0 --source <file|url>
+# M1 图片壁纸：挂一张图（默认常驻），验证完优雅停掉
+cargo run -p wpctl -- attach --monitor 0 --source out\wp-test-quadrant.png
+cargo run -p wpctl -- attach --monitor 0 --source <png|jpg|bmp> --no-pause   # 调试：不因前台全屏暂停
+cargo run -p wpctl -- stop
 cargo tauri dev   # 在 apps/desktop 下
 ```
 
