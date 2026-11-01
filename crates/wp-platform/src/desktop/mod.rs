@@ -124,6 +124,9 @@ pub enum PlatformError {
     NoDesktopHost,
     Win32 { context: &'static str, code: u32 },
     Unsupported(&'static str),
+    /// 调用方传进来的数据不合法（尺寸不符、缓冲区长度不对等）。
+    /// 需要带上具体数值，所以不是 `&'static str`。
+    Invalid(String),
 }
 
 impl std::fmt::Display for PlatformError {
@@ -132,6 +135,7 @@ impl std::fmt::Display for PlatformError {
             Self::NoDesktopHost => write!(f, "没有可用的桌面宿主窗口"),
             Self::Win32 { context, code } => write!(f, "{context} 失败，Win32 错误码 {code}"),
             Self::Unsupported(s) => write!(f, "不支持: {s}"),
+            Self::Invalid(s) => write!(f, "参数非法: {s}"),
         }
     }
 }

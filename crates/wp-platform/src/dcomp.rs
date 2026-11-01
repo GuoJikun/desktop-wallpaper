@@ -35,6 +35,9 @@ pub struct DcompSurface {
     _device: ID3D11Device,
     context: ID3D11DeviceContext,
     swap_chain: IDXGISwapChain1,
+    /// 交换链的后备缓冲。图片是「整屏覆盖」的静态内容，直接用
+    /// `UpdateSubresource` 把 CPU 侧 BGRA 拷进去即可，不需要着色器/采样器。
+    back_buffer: ID3D11Texture2D,
     rtv: ID3D11RenderTargetView,
     // 保持存活：visual/target/device 释放后画面立即消失。
     _visual: IDCompositionVisual,
@@ -119,11 +122,15 @@ impl DcompSurface {
             dcomp.Commit().map_err(|e| win32("Commit", e))?;
 
             let rtv = create_rtv(&device, &swap_chain)?;
+            let back_buffer: ID3D11Texture2D = swap_chain
+                .GetBuffer(0)
+                .map_err(|e| win32("GetBuffer", e))?;
 
             Ok(Self {
                 _device: device,
                 context,
                 swap_chain,
+                back_buffer,
                 rtv,
                 _visual: visual,
                 _target: target,
@@ -144,6 +151,49 @@ impl DcompSurface {
         ];
         unsafe {
             self.context.ClearRenderTargetView(&self.rtv, &color);
+            self.swap_chain
+                .Present(1, DXGI_PRESENT(0))
+                .ok()
+                .map_err(|e| win32("Present", e))?;
+        }
+        Ok(())
+    }
+
+    /// 把一整屏 BGRA8 像素拷进后备缓冲并提交一帧。
+    ///
+    /// 图片壁纸是静态的：缩放已在 CPU 侧做完，这里只是一次整块内存拷贝 + 一次
+    /// `Present`，所以不需要顶点/像素着色器，也不需要采样器状态。这样整条图片管线
+    /// 不依赖 `d3dcompiler_47.dll`，少一个运行期失败点。
+    ///
+    /// `pixels` 必须是紧密排列的 `width * height * 4` 字节，尺寸要和表面完全一致。
+    pub fn draw_bgra(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<(), PlatformError> {
+        if (width, height) != (self.width, self.height) {
+            return Err(PlatformError::Invalid(format!(
+                "图片尺寸 {width}x{height} 与表面 {}x{} 不一致",
+                self.width, self.height
+            )));
+        }
+        let expected = width as usize * height as usize * 4;
+        if pixels.len() != expected {
+            return Err(PlatformError::Invalid(format!(
+                "像素缓冲区长度 {} 与 {width}x{height} 不符（应为 {expected}）",
+                pixels.len()
+            )));
+        }
+        unsafe {
+            self.context.UpdateSubresource(
+                &self.back_buffer,
+                0,
+                None,
+                pixels.as_ptr() as *const _,
+                width * 4,
+                0,
+            );
             self.swap_chain
                 .Present(1, DXGI_PRESENT(0))
                 .ok()
